@@ -1,4 +1,4 @@
-/* ChatGPT Queue Runner — manhwa recap edition
+/* AURAL GPT Script — manhwa recap runner
  * Queues "go N" prompts on chatgpt.com, auto-sends the next the instant the
  * previous response finishes, harvests the [Panel ...] script from every
  * chapter into one ordered book file, and can split a book across multiple
@@ -89,6 +89,7 @@
   const PHASE = {
     IDLE: 'idle',
     DELAY: 'delay',
+    INSERTING: 'inserting',
     SENDING: 'sending',
     GENERATING: 'generating',
     STABILIZING: 'stabilizing',
@@ -198,25 +199,43 @@
 
   // ---------------------------------------------------------------- composer I/O
 
+  // Select only inside the editor. NEVER use document.execCommand('selectAll'):
+  // if the editor isn't the active element it selects the whole conversation,
+  // and replacing that selection re-lays-out thousands of nodes — that is what
+  // froze the page ("Page Unresponsive") on long chats.
+  function selectAllInEditor(editor) {
+    try {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    } catch { return false; }
+  }
+
   function insertPrompt(text) {
     const editor = getEditor();
     if (!editor) return false;
     editor.focus();
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    // multiline text goes in via a synthetic paste so ProseMirror keeps the line breaks
-    if (text.includes('\n')) {
-      try {
-        document.execCommand('selectAll', false, null);
-        const dt = new DataTransfer();
-        dt.setData('text/plain', text);
-        editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-        if (norm(editor.innerText).includes(norm(text.slice(0, 60)))) return true;
-      } catch {}
-    }
+    const landed = () => norm(editor.innerText).includes(norm(text.slice(0, 60)));
+    // synthetic paste keeps line breaks in ProseMirror and is cheap even for
+    // very large master prompts
     try {
-      document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, text);
-      if (norm(editor.innerText).includes(norm(text.slice(0, 60)))) return true;
+      selectAllInEditor(editor);
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+      if (landed()) return true;
+    } catch {}
+    try {
+      // insertText only when the editor really owns focus + selection
+      if (document.activeElement === editor || editor.contains(document.activeElement)) {
+        selectAllInEditor(editor);
+        document.execCommand('insertText', false, text);
+        if (landed()) return true;
+      }
     } catch {}
     try {
       editor.innerHTML = '';
@@ -228,6 +247,62 @@
       editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
       return true;
     } catch { return false; }
+  }
+
+  // A 70–150KB setup message (master prompt + style sample) inserted in one
+  // synchronous shot blocks the main thread long enough for the browser to
+  // show "Page Unresponsive" — so big text goes in as small chunks, yielding
+  // to the page between chunks.
+  const INSERT_CHUNK = 8000;
+
+  function caretToEnd(editor) {
+    try {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    } catch { return false; }
+  }
+
+  function insertPromptAsync(text, done) {
+    if (text.length <= INSERT_CHUNK) { done(insertPrompt(text)); return; }
+    const editor = getEditor();
+    if (!editor) { done(false); return; }
+    editor.focus();
+    selectAllInEditor(editor);
+    try { document.execCommand('delete', false, null); } catch {}
+    const chunks = [];
+    for (let i = 0; i < text.length; i += INSERT_CHUNK) chunks.push(text.slice(i, i + INSERT_CHUNK));
+    let i = 0;
+    let usePaste = true;
+    const step = () => {
+      const ed = getEditor();
+      if (!ed) { done(false); return; }
+      ed.focus();
+      caretToEnd(ed);
+      const before = (ed.textContent || '').length;
+      if (usePaste) {
+        try {
+          const dt = new DataTransfer();
+          dt.setData('text/plain', chunks[i]);
+          ed.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+        } catch {}
+      }
+      if ((ed.textContent || '').length <= before) {
+        // paste was ignored — try insertText for this chunk instead
+        usePaste = false;
+        caretToEnd(ed);
+        try { document.execCommand('insertText', false, chunks[i]); } catch {}
+        if ((ed.textContent || '').length <= before) { done(false); return; }
+      }
+      i++;
+      if (i < chunks.length) setTimeout(step, 40);
+      else done(true);
+    };
+    setTimeout(step, 0);
   }
 
   function clickSend() {
@@ -253,7 +328,9 @@
   }
 
   function attachFiles(files) {
-    const inputs = $$(SELECTORS.fileInput);
+    // never target our own panel's file picker — injecting into it re-fires
+    // its change listener and recurses until the tab hangs
+    const inputs = $$(SELECTORS.fileInput).filter(i => !i.closest('#cgqr-panel'));
     if (!inputs.length) return false;
     const input = inputs.find(i => (i.accept || '').includes('pdf')) || inputs[0];
     const dt = new DataTransfer();
@@ -323,8 +400,8 @@
       const done = () => {
         log(`Copied full script: ${chaps.length} chapters (${chaps[0].n}–${chaps[chaps.length - 1].n}).`);
         if (ui.copyBtn) {
-          ui.copyBtn.textContent = '✔ Copied!';
-          setTimeout(() => { if (ui.copyBtn) ui.copyBtn.textContent = '📋 Copy full script'; }, 1800);
+          ui.copyBtn.textContent = '✓ Copied';
+          setTimeout(() => { if (ui.copyBtn) ui.copyBtn.textContent = 'Copy full script'; }, 1800);
         }
       };
       const fallback = () => {
@@ -585,10 +662,21 @@
   }
 
   function tick() {
+    try {
+      runEngine();
+    } catch (e) {
+      // never let one bad tick take the page down
+      log(`Engine error: ${e && e.message ? e.message : e}`);
+      pauseRun('Unexpected error — queue paused.');
+    }
     updateUI();
+  }
+
+  function runEngine() {
     if (state.paused) return;
 
     const item = currentItem();
+    if (!item) return;
     const inPhase = now() - state.phaseSince;
 
     switch (state.phase) {
@@ -606,13 +694,23 @@
             break;
           }
           state.baselineAssistantCount = assistantCount();
-          if (!insertPrompt(item.text)) { failRun('Could not find the ChatGPT input box'); break; }
           item.status = 'running';
           item.startedAt = now();
           state.promptStartedAt = now();
-          setPhase(PHASE.SENDING);
-          log(`Sending ${state.idx + 1}/${state.queue.length}: "${item.isSetup ? 'setup message' : item.text}"`);
+          setPhase(PHASE.INSERTING);
+          insertPromptAsync(item.text, (ok) => {
+            if (state.phase !== PHASE.INSERTING) return; // reset/skip happened meanwhile
+            if (!ok) { failRun('Could not find the ChatGPT input box'); return; }
+            setPhase(PHASE.SENDING);
+            log(`Sending ${state.idx + 1}/${state.queue.length}: "${item.isSetup ? 'setup message' : item.text}"`);
+          });
         }
+        break;
+      }
+
+      case PHASE.INSERTING: {
+        // insertPromptAsync moves us on; this is just a watchdog
+        if (inPhase > 120000) failRun('Inserting the prompt took too long');
         break;
       }
 
@@ -633,8 +731,12 @@
           if (state.sendRetries < MAX_SEND_RETRIES) {
             state.sendRetries++;
             log(`Generation didn't start — retry ${state.sendRetries}/${MAX_SEND_RETRIES}…`);
-            insertPrompt(item.text);
-            setPhase(PHASE.SENDING);
+            setPhase(PHASE.INSERTING);
+            insertPromptAsync(item.text, (ok) => {
+              if (state.phase !== PHASE.INSERTING) return;
+              if (!ok) { failRun('Could not find the ChatGPT input box'); return; }
+              setPhase(PHASE.SENDING);
+            });
           } else {
             failRun('Prompt was sent but generation never started');
           }
@@ -677,6 +779,7 @@
 
   let ui = {};
   const logLines = [];
+  const UI_PREFS_KEY = 'cgqrUiPrefs';
 
   function log(msg) {
     const t = new Date().toLocaleTimeString();
@@ -700,6 +803,22 @@
     return node;
   }
 
+  function makeSwitch(checked, labelText, title) {
+    const input = el('input', { type: 'checkbox' });
+    input.checked = checked;
+    const row = el('label', { class: 'cgqr-switch-row', title: title || '' },
+      el('span', { class: 'cgqr-switch-label', text: labelText }),
+      el('span', { class: 'cgqr-switch' }, input, el('span', { class: 'cgqr-switch-track' })));
+    return { row, input };
+  }
+
+  function loadUiPrefs() {
+    try { return JSON.parse(localStorage.getItem(UI_PREFS_KEY)) || {}; } catch { return {}; }
+  }
+  function saveUiPrefs(prefs) {
+    try { localStorage.setItem(UI_PREFS_KEY, JSON.stringify(prefs)); } catch {}
+  }
+
   function refreshRangeInputs() {
     if (ui.fromInput) ui.fromInput.value = settings.rangeStart;
     if (ui.toInput) ui.toInput.value = settings.rangeEnd;
@@ -711,34 +830,80 @@
     ui.bannerText.textContent = `This tab: chapters ${state.assignment.s}–${state.assignment.e}`;
   }
 
-  function buildPanel() {
-    const panel = el('div', { id: 'cgqr-panel' });
+  function makeDraggable(panel, handle) {
+    let startX = 0, startY = 0, startLeft = 0, startTop = 0, dragging = false;
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('button')) return;
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      startX = e.clientX; startY = e.clientY;
+      startLeft = rect.left; startTop = rect.top;
+      handle.setPointerCapture(e.pointerId);
+    });
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const left = Math.max(0, Math.min(window.innerWidth - 80, startLeft + e.clientX - startX));
+      const top = Math.max(0, Math.min(window.innerHeight - 40, startTop + e.clientY - startY));
+      panel.style.left = left + 'px';
+      panel.style.top = top + 'px';
+      panel.style.right = 'auto';
+    });
+    handle.addEventListener('pointerup', () => {
+      if (!dragging) return;
+      dragging = false;
+      const prefs = loadUiPrefs();
+      prefs.left = panel.style.left;
+      prefs.top = panel.style.top;
+      saveUiPrefs(prefs);
+    });
+  }
 
-    const collapseBtn = el('button', { class: 'cgqr-icon-btn', text: '–', title: 'Collapse' });
+  function buildPanel() {
+    const prefs = loadUiPrefs();
+    const panel = el('div', { id: 'cgqr-panel' });
+    if (prefs.left && prefs.top) {
+      panel.style.left = prefs.left;
+      panel.style.top = prefs.top;
+      panel.style.right = 'auto';
+    }
+
+    // ---- header / brand
+    ui.statusDot = el('span', { class: 'cgqr-dot cgqr-dot-idle' });
+    const collapseBtn = el('button', { class: 'cgqr-icon-btn', title: 'Collapse' },
+      el('span', { class: 'cgqr-chevron' }));
     const header = el('div', { class: 'cgqr-header' },
-      el('span', { class: 'cgqr-title', text: '⚡ Aural GPT Script' }),
-      collapseBtn);
+      el('div', { class: 'cgqr-brand' },
+        el('div', { class: 'cgqr-logo', text: 'A' }),
+        el('div', { class: 'cgqr-brand-text' },
+          el('div', { class: 'cgqr-brand-name', text: 'AURAL' }),
+          el('div', { class: 'cgqr-brand-sub', text: 'GPT Script Runner' }))),
+      el('div', { class: 'cgqr-header-actions' }, ui.statusDot, collapseBtn));
     panel.appendChild(header);
 
     const body = el('div', { class: 'cgqr-body' });
     panel.appendChild(body);
 
-    collapseBtn.addEventListener('click', () => {
-      body.classList.toggle('cgqr-hidden');
-      collapseBtn.textContent = body.classList.contains('cgqr-hidden') ? '+' : '–';
-    });
+    const setCollapsed = (collapsed) => {
+      body.classList.toggle('cgqr-hidden', collapsed);
+      panel.classList.toggle('cgqr-collapsed', collapsed);
+      const p = loadUiPrefs(); p.collapsed = collapsed; saveUiPrefs(p);
+    };
+    collapseBtn.addEventListener('click', () => setCollapsed(!body.classList.contains('cgqr-hidden')));
+    if (prefs.collapsed) setCollapsed(true);
+
+    makeDraggable(panel, header);
 
     // ---- assignment banner (batch tabs)
     ui.bannerText = el('span', { class: 'cgqr-banner-text', text: '' });
     const attachInput = el('input', { type: 'file', accept: '.pdf,application/pdf', multiple: 'multiple', class: 'cgqr-hidden' });
-    const beginBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary', text: '📎 Attach PDFs + Begin' });
+    const beginBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary', text: 'Attach PDFs + Begin' });
     beginBtn.addEventListener('click', () => attachInput.click());
     attachInput.addEventListener('change', () => {
       const files = Array.from(attachInput.files || []);
       if (files.length) beginAssignedRun(files);
       attachInput.value = '';
     });
-    const beginNoPdfBtn = el('button', { class: 'cgqr-btn', text: 'Begin (PDFs already uploaded)' });
+    const beginNoPdfBtn = el('button', { class: 'cgqr-btn', text: 'Begin (PDFs uploaded)' });
     beginNoPdfBtn.addEventListener('click', () => beginAssignedRun(null));
     ui.banner = el('div', { class: 'cgqr-banner cgqr-hidden' },
       ui.bannerText,
@@ -746,52 +911,66 @@
       attachInput);
     body.appendChild(ui.banner);
 
-    // ---- book setup (collapsible)
+    // ---- book setup (collapsible card)
     const masterArea = el('textarea', { class: 'cgqr-textarea', rows: '4', placeholder: 'Your big master prompt…' });
     masterArea.value = settings.masterPrompt;
     const linkInput = el('input', { class: 'cgqr-input', placeholder: 'https://mangafire.to/… (book link)' });
     linkInput.value = settings.bookLink;
     const sampleArea = el('textarea', { class: 'cgqr-textarea', rows: '3', placeholder: 'STYLE SAMPLE — paste example script lines…' });
     sampleArea.value = settings.styleSample;
-    const sendSetupBtn = el('button', { class: 'cgqr-btn', text: '✉ Send setup now' });
+    const sendSetupBtn = el('button', { class: 'cgqr-btn', text: 'Send setup now' });
     sendSetupBtn.addEventListener('click', () => {
       const setup = composeSetup();
       if (!setup) { log('Book setup fields are empty.'); return; }
-      if (insertPrompt(setup)) {
+      log('Inserting setup message…');
+      insertPromptAsync(setup, (ok) => {
+        if (!ok) { log('Could not find the ChatGPT input box.'); return; }
         setTimeout(() => { if (!clickSend()) log('Setup text inserted — press ChatGPT\'s send button when uploads finish.'); }, 600);
         log('Setup message sent (or waiting on uploads).');
-      } else log('Could not find the ChatGPT input box.');
+      });
     });
     const setupDetails = el('details', { class: 'cgqr-details' },
-      el('summary', { class: 'cgqr-summary', text: '📖 Book setup (prompt · link · sample)' }),
-      el('div', { class: 'cgqr-section' },
+      el('summary', { class: 'cgqr-summary', text: 'Book setup' }),
+      el('div', { class: 'cgqr-card-body' },
         el('label', { class: 'cgqr-label', text: 'Master prompt' }), masterArea,
-        el('label', { class: 'cgqr-label', text: 'Book link (MangaFire or other)' }), linkInput,
+        el('label', { class: 'cgqr-label', text: 'Book link' }), linkInput,
         el('label', { class: 'cgqr-label', text: 'Style sample' }), sampleArea,
         sendSetupBtn));
-    body.appendChild(setupDetails);
+    body.appendChild(el('div', { class: 'cgqr-card' }, setupDetails));
 
-    // ---- mode toggle
+    // ---- queue card: mode toggle + range + timing
     const modeTemplate = el('button', { class: 'cgqr-tab', text: 'Template' });
     const modeList = el('button', { class: 'cgqr-tab', text: 'Custom list' });
-    body.appendChild(el('div', { class: 'cgqr-tabs' }, modeTemplate, modeList));
 
     const tplInput = el('input', { class: 'cgqr-input', value: settings.template, title: '{n} is replaced with the number' });
     ui.fromInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', value: settings.rangeStart });
     ui.toInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', value: settings.rangeEnd });
     const tplSection = el('div', { class: 'cgqr-section' },
-      el('label', { class: 'cgqr-label', text: 'Prompt template ({n} = chapter number)' }),
+      el('label', { class: 'cgqr-label', text: 'Prompt template · {n} = chapter' }),
       tplInput,
       el('div', { class: 'cgqr-row' },
         el('label', { class: 'cgqr-label-inline', text: 'From' }), ui.fromInput,
         el('label', { class: 'cgqr-label-inline', text: 'to' }), ui.toInput));
-    body.appendChild(tplSection);
 
     const listArea = el('textarea', { class: 'cgqr-textarea', rows: '5', placeholder: 'One prompt per line…' });
     listArea.value = settings.list;
     const listSection = el('div', { class: 'cgqr-section cgqr-hidden' },
       el('label', { class: 'cgqr-label', text: 'Prompts (one per line)' }), listArea);
-    body.appendChild(listSection);
+
+    const delayInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '0', value: settings.delaySec });
+    const stableInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '2', value: settings.stableSec });
+    const timeoutInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '1', value: settings.timeoutMin });
+    const timingRow = el('div', { class: 'cgqr-row cgqr-row-3' },
+      el('div', { class: 'cgqr-field' },
+        el('label', { class: 'cgqr-label', text: 'Delay s', title: 'Wait after a response finishes before sending the next prompt' }), delayInput),
+      el('div', { class: 'cgqr-field' },
+        el('label', { class: 'cgqr-label', text: 'Settle s', title: 'How long generation must stay stopped to count as finished' }), stableInput),
+      el('div', { class: 'cgqr-field' },
+        el('label', { class: 'cgqr-label', text: 'Max min', title: 'Pause the queue if one prompt takes longer than this' }), timeoutInput));
+
+    body.appendChild(el('div', { class: 'cgqr-card' },
+      el('div', { class: 'cgqr-tabs' }, modeTemplate, modeList),
+      tplSection, listSection, timingRow));
 
     function applyMode() {
       const isTpl = settings.mode === 'template';
@@ -803,27 +982,23 @@
     modeTemplate.addEventListener('click', () => { settings.mode = 'template'; saveSettings(); applyMode(); });
     modeList.addEventListener('click', () => { settings.mode = 'list'; saveSettings(); applyMode(); });
 
-    // ---- timing settings
-    const delayInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '0', value: settings.delaySec });
-    const stableInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '2', value: settings.stableSec });
-    const timeoutInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '1', value: settings.timeoutMin });
-    body.appendChild(el('div', { class: 'cgqr-section' },
-      el('div', { class: 'cgqr-row' },
-        el('label', { class: 'cgqr-label-inline', text: 'Delay (s)', title: 'Wait after a response finishes before sending the next prompt' }), delayInput,
-        el('label', { class: 'cgqr-label-inline', text: 'Settle (s)', title: 'How long generation must stay stopped to count as finished' }), stableInput,
-        el('label', { class: 'cgqr-label-inline', text: 'Max (min)', title: 'Pause the queue if one prompt takes longer than this' }), timeoutInput)));
+    // ---- options card: switches + parallel tabs
+    const harvestSw = makeSwitch(settings.harvest, 'Harvest [Panel] script into book');
+    const setupSw = makeSwitch(settings.sendSetupFirst, 'Send Book setup first on Start');
+    const beepSw = makeSwitch(settings.beepWhenDone, 'Beep on finish / error');
 
-    // ---- toggles
-    const harvestChk = el('input', { type: 'checkbox' });
-    harvestChk.checked = settings.harvest;
-    const setupChk = el('input', { type: 'checkbox' });
-    setupChk.checked = settings.sendSetupFirst;
-    const beepChk = el('input', { type: 'checkbox' });
-    beepChk.checked = settings.beepWhenDone;
-    body.appendChild(el('div', { class: 'cgqr-section' },
-      el('label', { class: 'cgqr-check' }, harvestChk, ' Harvest [Panel] script into the book'),
-      el('label', { class: 'cgqr-check' }, setupChk, ' Send Book setup as first message on Start'),
-      el('label', { class: 'cgqr-check' }, beepChk, ' Beep when queue finishes / errors')));
+    const tabSelect = el('select', { class: 'cgqr-input cgqr-select' });
+    [2, 3, 4].forEach(k => tabSelect.appendChild(el('option', { value: String(k), text: `${k} tabs` })));
+    tabSelect.value = String(settings.tabCount);
+    tabSelect.addEventListener('change', () => { settings.tabCount = parseInt(tabSelect.value, 10) || 3; saveSettings(); });
+    const batchBtn = el('button', { class: 'cgqr-btn', text: 'Open batch tabs' });
+    batchBtn.addEventListener('click', openBatchTabs);
+
+    body.appendChild(el('div', { class: 'cgqr-card' },
+      harvestSw.row, setupSw.row, beepSw.row,
+      el('div', { class: 'cgqr-row cgqr-row-parallel' },
+        el('label', { class: 'cgqr-label-inline', text: 'Parallel', title: 'Split the chapter range across this many tabs' }),
+        tabSelect, batchBtn)));
 
     const bind = (input, key, parse) => input.addEventListener('change', () => {
       settings[key] = parse(input);
@@ -836,31 +1011,19 @@
     bind(delayInput, 'delaySec', i => Math.max(0, parseFloat(i.value) || 0));
     bind(stableInput, 'stableSec', i => Math.max(2, parseFloat(i.value) || 6));
     bind(timeoutInput, 'timeoutMin', i => Math.max(1, parseFloat(i.value) || 25));
-    bind(harvestChk, 'harvest', i => i.checked);
-    bind(setupChk, 'sendSetupFirst', i => i.checked);
-    bind(beepChk, 'beepWhenDone', i => i.checked);
+    bind(harvestSw.input, 'harvest', i => i.checked);
+    bind(setupSw.input, 'sendSetupFirst', i => i.checked);
+    bind(beepSw.input, 'beepWhenDone', i => i.checked);
     bind(masterArea, 'masterPrompt', i => i.value);
     bind(linkInput, 'bookLink', i => i.value);
     bind(sampleArea, 'styleSample', i => i.value);
 
-    // ---- multi-tab
-    const tabSelect = el('select', { class: 'cgqr-input cgqr-num' });
-    [2, 3, 4].forEach(k => tabSelect.appendChild(el('option', { value: String(k), text: `${k} tabs` })));
-    tabSelect.value = String(settings.tabCount);
-    tabSelect.addEventListener('change', () => { settings.tabCount = parseInt(tabSelect.value, 10) || 3; saveSettings(); });
-    const batchBtn = el('button', { class: 'cgqr-btn', text: '🗂 Open batch tabs' });
-    batchBtn.addEventListener('click', openBatchTabs);
-    body.appendChild(el('div', { class: 'cgqr-section' },
-      el('div', { class: 'cgqr-row' },
-        el('label', { class: 'cgqr-label-inline', text: 'Parallel:', title: 'Split the chapter range across this many tabs' }),
-        tabSelect, batchBtn)));
-
     // ---- controls
-    const startBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary', text: '▶ Start' });
-    const pauseBtn = el('button', { class: 'cgqr-btn', text: '⏸ Pause' });
-    const skipBtn = el('button', { class: 'cgqr-btn', text: '⏭ Skip', title: 'Mark current prompt done and move on' });
-    const resetBtn = el('button', { class: 'cgqr-btn cgqr-btn-danger', text: '⟲ Reset' });
-    body.appendChild(el('div', { class: 'cgqr-controls' }, startBtn, pauseBtn, skipBtn, resetBtn));
+    const startBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary cgqr-btn-start', text: 'Start' });
+    const pauseBtn = el('button', { class: 'cgqr-btn', text: 'Pause' });
+    const skipBtn = el('button', { class: 'cgqr-btn', text: 'Skip', title: 'Mark current prompt done and move on' });
+    const resetBtn = el('button', { class: 'cgqr-btn cgqr-btn-danger', text: 'Reset' });
+    body.appendChild(el('div', { class: 'cgqr-controls cgqr-controls-main' }, startBtn, pauseBtn, skipBtn, resetBtn));
 
     startBtn.addEventListener('click', () => {
       if (state.queue.length && state.idx < state.queue.length &&
@@ -890,14 +1053,14 @@
     body.appendChild(el('div', { class: 'cgqr-progress' }, ui.progressBar));
 
     // ---- book / script output
-    ui.bookStatus = el('div', { class: 'cgqr-status', text: '…' });
-    ui.copyBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary', text: '📋 Copy full script' });
+    ui.bookStatus = el('div', { class: 'cgqr-book-status', text: '…' });
+    ui.copyBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary', text: 'Copy full script' });
     ui.copyBtn.addEventListener('click', copyBook);
-    const dlBtn = el('button', { class: 'cgqr-btn', text: '💾 Download' });
+    const dlBtn = el('button', { class: 'cgqr-btn', text: 'Download' });
     dlBtn.addEventListener('click', downloadBook);
-    const clearBtn = el('button', { class: 'cgqr-btn cgqr-btn-danger', text: '🗑 Clear' });
+    const clearBtn = el('button', { class: 'cgqr-btn cgqr-btn-danger', text: 'Clear' });
     clearBtn.addEventListener('click', clearBook);
-    body.appendChild(el('div', { class: 'cgqr-section cgqr-book' },
+    body.appendChild(el('div', { class: 'cgqr-card cgqr-book' },
       el('label', { class: 'cgqr-label', text: 'Book script' }),
       ui.bookStatus,
       el('div', { class: 'cgqr-controls' }, ui.copyBtn, dlBtn, clearBtn)));
@@ -911,24 +1074,29 @@
     document.documentElement.appendChild(panel);
   }
 
+  let lastStatusText = '';
   function updateUI() {
     if (!ui.status) return;
     const total = state.queue.length;
     const done = state.queue.filter(q => q.status === 'done').length;
     let text;
+    let dotClass = 'cgqr-dot-idle';
     if (!total) {
       text = 'Idle — configure and press Start';
-      ui.startBtn.textContent = '▶ Start';
+      ui.startBtn.textContent = 'Start';
     } else if (state.phase === PHASE.FINISHED) {
       text = `✅ Finished ${done}/${total}`;
-      ui.startBtn.textContent = '▶ Start';
+      ui.startBtn.textContent = 'Start';
+      dotClass = 'cgqr-dot-done';
     } else if (state.paused) {
       text = `⏸ Paused at ${done}/${total}`;
-      ui.startBtn.textContent = '▶ Resume';
+      ui.startBtn.textContent = 'Resume';
+      dotClass = state.phase === PHASE.ERROR ? 'cgqr-dot-error' : 'cgqr-dot-paused';
     } else {
       const item = currentItem();
       const phaseLabel = {
         [PHASE.DELAY]: 'waiting to send',
+        [PHASE.INSERTING]: 'inserting prompt',
         [PHASE.SENDING]: 'sending',
         [PHASE.GENERATING]: 'generating',
         [PHASE.STABILIZING]: 'finishing up',
@@ -936,9 +1104,16 @@
       const label = item ? (item.isSetup ? 'setup message' : `"${item.text}"`) : '';
       const elapsed = item && item.startedAt ? ` · ${fmtDur(now() - item.startedAt)}` : '';
       text = `${done}/${total} done — ${phaseLabel}${label ? `: ${label}` : ''}${elapsed}`;
-      ui.startBtn.textContent = '▶ Running…';
+      ui.startBtn.textContent = 'Running…';
+      dotClass = 'cgqr-dot-live';
     }
-    ui.status.textContent = text;
+    if (text !== lastStatusText) {
+      lastStatusText = text;
+      ui.status.textContent = text;
+    }
+    if (ui.statusDot && !ui.statusDot.classList.contains(dotClass)) {
+      ui.statusDot.className = `cgqr-dot ${dotClass}`;
+    }
     ui.progressBar.style.width = total ? `${(done / total) * 100}%` : '0%';
   }
 
