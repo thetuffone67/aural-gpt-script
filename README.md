@@ -5,7 +5,13 @@ sends "go 1" → waits for the chapter script → sends "go 2" → … and harve
 every chapter's `[Panel ...]` lines into one ordered book script you copy
 with a single click.
 
-Works in **Chrome, Opera, Edge, Brave** (any Chromium browser).
+Works in **Chrome, AVG Secure Browser, Opera, Edge, Brave** (any Chromium browser).
+
+## Download
+
+Grab `aural-gpt-script.zip` from the
+[latest release](https://github.com/thetuffone67/aural-gpt-script/releases/latest)
+and unzip it, then follow the install steps below.
 
 ## Install (load unpacked)
 
