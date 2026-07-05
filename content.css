@@ -1,0 +1,241 @@
+#cgqr-panel {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  width: 320px;
+  z-index: 2147483646;
+  background: #16181d;
+  color: #e6e8ee;
+  border: 1px solid #2c313c;
+  border-radius: 12px;
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 12.5px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+
+.cgqr-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #1d212a;
+  border-bottom: 1px solid #2c313c;
+  cursor: default;
+  user-select: none;
+}
+
+.cgqr-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.cgqr-icon-btn {
+  background: none;
+  border: none;
+  color: #9aa3b2;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.cgqr-icon-btn:hover { background: #2c313c; color: #fff; }
+
+.cgqr-body {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.cgqr-hidden { display: none !important; }
+
+.cgqr-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.cgqr-tab {
+  flex: 1;
+  padding: 5px 0;
+  background: #1d212a;
+  border: 1px solid #2c313c;
+  border-radius: 8px;
+  color: #9aa3b2;
+  cursor: pointer;
+  font-size: 12px;
+}
+.cgqr-tab-active {
+  background: #2f6feb22;
+  border-color: #2f6feb;
+  color: #7ea6ff;
+  font-weight: 600;
+}
+
+.cgqr-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cgqr-label {
+  color: #9aa3b2;
+  font-size: 11.5px;
+}
+
+.cgqr-label-inline {
+  color: #9aa3b2;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.cgqr-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cgqr-input, .cgqr-textarea {
+  background: #0f1116;
+  border: 1px solid #2c313c;
+  border-radius: 8px;
+  color: #e6e8ee;
+  padding: 6px 8px;
+  font-size: 12.5px;
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+.cgqr-input:focus, .cgqr-textarea:focus {
+  outline: none;
+  border-color: #2f6feb;
+}
+
+.cgqr-num { width: 62px; flex: none; }
+
+.cgqr-textarea { resize: vertical; min-height: 60px; }
+
+.cgqr-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #c6ccd8;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.cgqr-controls {
+  display: flex;
+  gap: 6px;
+}
+
+.cgqr-btn {
+  flex: 1;
+  padding: 7px 0;
+  background: #1d212a;
+  border: 1px solid #2c313c;
+  border-radius: 8px;
+  color: #e6e8ee;
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cgqr-btn:hover { background: #262b36; }
+
+.cgqr-btn-primary {
+  background: #2f6feb;
+  border-color: #2f6feb;
+  font-weight: 600;
+}
+.cgqr-btn-primary:hover { background: #4280ff; }
+
+.cgqr-btn-danger:hover { background: #6b2530; border-color: #a33; }
+
+.cgqr-status {
+  color: #c6ccd8;
+  font-size: 12px;
+  min-height: 16px;
+  word-break: break-word;
+}
+
+.cgqr-progress {
+  height: 6px;
+  background: #0f1116;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.cgqr-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #2f6feb, #35c98f);
+  transition: width 0.4s ease;
+}
+
+.cgqr-details {
+  border: 1px solid #2c313c;
+  border-radius: 8px;
+  background: #12141a;
+  padding: 0;
+}
+
+.cgqr-details[open] { padding-bottom: 10px; }
+
+.cgqr-summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  color: #c6ccd8;
+  font-size: 12px;
+  user-select: none;
+  list-style: none;
+}
+.cgqr-summary::-webkit-details-marker { display: none; }
+.cgqr-summary::before { content: '▸ '; color: #9aa3b2; }
+.cgqr-details[open] .cgqr-summary::before { content: '▾ '; }
+.cgqr-details .cgqr-section { padding: 0 10px; }
+
+.cgqr-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #2f6feb1a;
+  border: 1px solid #2f6feb;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.cgqr-banner-text {
+  color: #7ea6ff;
+  font-weight: 600;
+  font-size: 12.5px;
+}
+
+select.cgqr-input {
+  width: auto;
+  flex: none;
+  padding: 6px 4px;
+}
+
+.cgqr-book {
+  border-top: 1px solid #2c313c;
+  padding-top: 10px;
+}
+
+.cgqr-log {
+  margin: 0;
+  background: #0f1116;
+  border: 1px solid #22262f;
+  border-radius: 8px;
+  padding: 8px;
+  height: 110px;
+  overflow-y: auto;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: #9aa3b2;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
