@@ -208,14 +208,24 @@
 
   // ---------------------------------------------------------------- queue building
 
+  function chapterNumFromName(name) {
+    let m = name.match(/chapter[\s_\-]*(\d+)/i);
+    if (m) return parseInt(m[1], 10);
+    m = name.match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : null;
+  }
+
   function chapterNumberFromText(text, fallback) {
     const m = text.match(/(\d+)\s*$/);
     return m ? parseInt(m[1], 10) : fallback;
   }
 
-  function buildQueue() {
+  function buildQueue(chapterNums) {
     const items = [];
-    if (settings.mode === 'template') {
+    if (chapterNums && chapterNums.length) {
+      chapterNums.forEach(n =>
+        items.push({ text: settings.template.replaceAll('{n}', String(n)), n, status: 'pending', elapsedMs: 0 }));
+    } else if (settings.mode === 'template') {
       const start = Math.min(settings.rangeStart, settings.rangeEnd);
       const end = Math.max(settings.rangeStart, settings.rangeEnd);
       for (let n = start; n <= end; n++) {
@@ -369,6 +379,13 @@
       }));
     }
     return true;
+  }
+
+  function getChatGPTFileInput() {
+    const inputs = $$(SELECTORS.fileInput).filter(i => !i.closest('#cgqr-panel'));
+    return inputs.find(i => i.id === 'upload-files') ||
+      inputs.find(i => !i.getAttribute('accept') || (i.accept || '').includes('pdf')) ||
+      inputs[0] || null;
   }
 
   function attachFiles(files) {
@@ -564,30 +581,38 @@
     adoptAssignment();
     refreshRangeInputs();
 
+    // The chapters come from the FILE NAMES, not from counting files against
+    // the range — chapter_7_script_context.pdf runs as "go 7". Un-numbered
+    // PDFs (hook_script_context.pdf, ungrouped_panels…) ride along as extra
+    // context. Whatever happens, something always runs — never a dead click.
+    let chapterNums = null;
     if (files && files.length) {
-      const sorted = files.slice().sort((x, y) =>
-        x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: 'base' }));
-      const rangeLen = a.e - a.s + 1;
-      let picked;
-      if (sorted.length === rangeLen) {
-        picked = sorted;
-        log(`Attaching ${picked.length} PDFs (you selected exactly this tab's chapters).`);
-      } else if (sorted.length >= a.e) {
-        picked = sorted.slice(a.s - 1, a.e);
-        log(`You selected ${sorted.length} PDFs — using files ${a.s}–${a.e} by filename order for chapters ${a.s}–${a.e}.`);
+      // files were selected through ChatGPT'S OWN picker, so ChatGPT is
+      // already uploading them (chips visible). Our only job is reading the
+      // chapter numbers out of the file names to build the queue.
+      const parsed = files.map(f => ({ f, n: chapterNumFromName(f.name) }));
+      const extras = parsed.filter(x => x.n == null).map(x => x.f);
+      let numbered = parsed.filter(x => x.n != null);
+      // batch tab: run only this tab's assigned chapters when they overlap
+      if (state.assignment && numbered.some(x => x.n >= a.s && x.n <= a.e)) {
+        numbered = numbered.filter(x => x.n >= a.s && x.n <= a.e);
+      }
+      numbered.sort((x, y) => x.n - y.n);
+      if (numbered.length) {
+        chapterNums = [...new Set(numbered.map(x => x.n))];
+        settings.rangeStart = chapterNums[0];
+        settings.rangeEnd = chapterNums[chapterNums.length - 1];
+        refreshRangeInputs();
+        log(`ChatGPT is uploading ${files.length} PDFs → queueing chapters ${chapterNums.join(', ')}` +
+          (extras.length ? ` (extra context: ${extras.map(f => f.name).join(', ')})` : '') + '.');
       } else {
-        log(`⚠️ You selected ${sorted.length} PDFs but this tab needs chapters ${a.s}–${a.e}. Select either exactly ${rangeLen} files or the whole book.`);
-        return;
+        log(`Couldn't read chapter numbers from the file names — running the configured range ${a.s}–${a.e}.`);
       }
-      if (!attachFiles(picked)) {
-        log('⚠️ Could not find ChatGPT\'s file upload input. Drag the PDFs into the chat manually, then press Start.');
-        return;
-      }
-      log('PDFs handed to ChatGPT — uploads run while the setup message waits to send.');
+      log('The setup message will send itself as soon as the uploads finish.');
     }
 
     settings.sendSetupFirst = true;
-    state.queue = buildQueue();
+    state.queue = buildQueue(chapterNums);
     state.queueFp = settingsFingerprint();
     state.idx = 0;
     if (!state.queue.length) { log('Nothing to queue.'); return; }
@@ -596,7 +621,8 @@
     setPhase(PHASE.DELAY);
     state.phaseSince = now() - settings.delaySec * 1000;
     persistState();
-    log(`Begun: setup message + chapters ${a.s}–${a.e}.`);
+    const chaps = state.queue.filter(q => !q.isSetup);
+    log(`Begun: setup message + ${chaps.length} chapters (${chaps[0] ? chaps[0].text : ''} → ${chaps.length ? chaps[chaps.length - 1].text : ''}).`);
     updateUI();
   }
 
@@ -972,7 +998,6 @@
 
   function showAssignmentBanner() {
     if (!ui.banner || !state.assignment) return;
-    ui.banner.classList.remove('cgqr-hidden');
     ui.bannerText.textContent = `This tab: chapters ${state.assignment.s}–${state.assignment.e}`;
   }
 
@@ -1041,20 +1066,34 @@
 
     // ---- assignment banner (batch tabs)
     ui.bannerText = el('span', { class: 'cgqr-banner-text', text: '' });
-    const attachInput = el('input', { type: 'file', accept: '.pdf,application/pdf', multiple: 'multiple', class: 'cgqr-hidden' });
     const beginBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary', text: 'Attach PDFs + Begin' });
-    beginBtn.addEventListener('click', () => attachInput.click());
-    attachInput.addEventListener('change', () => {
-      const files = Array.from(attachInput.files || []);
-      if (files.length) beginAssignedRun(files);
-      attachInput.value = '';
+    let gptPickerArmed = false;
+    beginBtn.addEventListener('click', () => {
+      // chatgpt.com ignores files injected by scripts (untrusted events), so
+      // we open ChatGPT'S OWN picker instead: the user's selection reaches
+      // ChatGPT as a real user action (chips + uploads guaranteed), and we
+      // read the chosen file names to build the chapter queue.
+      const gptInput = getChatGPTFileInput();
+      if (!gptInput) {
+        log('⚠️ Couldn\'t find ChatGPT\'s upload input — add the PDFs via ChatGPT\'s + menu, then press "Begin (PDFs uploaded)".');
+        return;
+      }
+      if (!gptPickerArmed) {
+        gptPickerArmed = true;
+        gptInput.addEventListener('change', () => {
+          const files = Array.from(gptInput.files || []);
+          if (files.length) beginAssignedRun(files);
+        }, { once: true });
+      }
+      log('ChatGPT\'s file picker opened — select this tab\'s chapter PDFs.');
+      gptInput.click();
     });
     const beginNoPdfBtn = el('button', { class: 'cgqr-btn', text: 'Begin (PDFs uploaded)' });
     beginNoPdfBtn.addEventListener('click', () => beginAssignedRun(null));
-    ui.banner = el('div', { class: 'cgqr-banner cgqr-hidden' },
+    ui.bannerText.textContent = 'Whole book in this tab';
+    ui.banner = el('div', { class: 'cgqr-banner' },
       ui.bannerText,
-      el('div', { class: 'cgqr-controls' }, beginBtn, beginNoPdfBtn),
-      attachInput);
+      el('div', { class: 'cgqr-controls' }, beginBtn, beginNoPdfBtn));
     body.appendChild(ui.banner);
 
     // ---- book setup (collapsible card)
