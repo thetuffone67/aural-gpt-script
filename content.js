@@ -42,6 +42,32 @@
     return nodes.length ? (nodes[nodes.length - 1].innerText || '') : '';
   };
 
+  // Long chats get VIRTUALIZED: ChatGPT unmounts old messages, so message
+  // COUNTS stop growing even though new responses arrive. Identify the last
+  // message by its id instead — counts are only kept as a fallback signal.
+  const nodeKey = (n) => {
+    if (!n) return '';
+    const id = n.getAttribute('data-message-id') ||
+      (n.closest('[data-message-id]') || {}).getAttribute?.('data-message-id');
+    if (id) return 'id:' + id;
+    const t = n.textContent || '';
+    return 'tx:' + t.length + ':' + t.slice(0, 40) + ':' + t.slice(-40);
+  };
+  const lastAssistantKey = () => {
+    const nodes = assistantNodes();
+    return nodes.length ? nodeKey(nodes[nodes.length - 1]) : '';
+  };
+  const lastUserKey = () => {
+    const nodes = $$(SELECTORS.userMsg);
+    return nodes.length ? nodeKey(nodes[nodes.length - 1]) : '';
+  };
+  const newAssistantArrived = () =>
+    assistantCount() > state.baselineAssistantCount ||
+    (lastAssistantKey() !== '' && lastAssistantKey() !== state.baselineAssistantKey);
+  const promptLeftComposer = () =>
+    userCount() > state.baselineUserCount ||
+    (lastUserKey() !== '' && lastUserKey() !== state.baselineUserKey);
+
   const now = () => Date.now();
   const fmtDur = (ms) => {
     const s = Math.floor(ms / 1000);
@@ -110,6 +136,11 @@
     lastClickAt: 0,
     baselineAssistantCount: 0,
     baselineUserCount: 0,
+    baselineAssistantKey: '',
+    baselineUserKey: '',
+    stabLen: -1,
+    stabLenAt: 0,
+    lastHarvest: null, // { n, len } — last chapter saved, for post-stall re-save
     promptStartedAt: 0,
     assignment: null, // { s, e } chapter range assigned to this tab
   };
@@ -594,6 +625,25 @@
 
   // ---------------------------------------------------------------- engine
 
+  // ChatGPT sometimes stalls mid-answer (stop button gone) and resumes a few
+  // seconds later. If we harvested during the stall we stored a truncated
+  // chapter — so right before the NEXT prompt is sent, while the previous
+  // response is provably final, check whether it grew and re-save it.
+  function maybeResavePrev() {
+    const h = state.lastHarvest;
+    if (!h || h.n == null || !h.key) return;
+    // locate the chapter's own message by id — works even after newer
+    // messages were sent below it
+    const node = assistantNodes().find(n => nodeKey(n) === h.key);
+    if (!node) return;
+    const panels = extractPanels(node.innerText || '');
+    if (panels && panels.length > h.len) {
+      log(`Chapter ${h.n} kept generating after a stall — re-saved with the full text (${panels.length} vs ${h.len} chars).`);
+      saveChapter(h.n, panels);
+      h.len = panels.length;
+    }
+  }
+
   const TICK_MS = 500;
   const START_TIMEOUT_MS = 25000;      // normal prompt: generation must start within this
   const SETUP_START_TIMEOUT_MS = 600000; // setup message waits for big PDF uploads
@@ -670,6 +720,7 @@
   }
 
   function completeCurrentItem() {
+    maybeResavePrev();
     const item = currentItem();
     item.status = 'done';
     item.elapsedMs = now() - (item.startedAt || now());
@@ -688,6 +739,12 @@
       log(`Engine error: ${e && e.message ? e.message : e}`);
       pauseRun('Unexpected error — queue paused.');
     }
+    // continuous watch (even when paused or finished): if the last saved
+    // chapter's message kept growing after a stall, re-save the full text
+    if (now() - (state.lastResaveCheck || 0) > 2000) {
+      state.lastResaveCheck = now();
+      try { maybeResavePrev(); } catch {}
+    }
     updateUI();
   }
 
@@ -702,18 +759,24 @@
       case PHASE.DELAY: {
         if (inPhase >= settings.delaySec * 1000) {
           if (isGenerating()) {
-            log('Page is still generating; waiting…');
-            setPhase(PHASE.GENERATING);
+            // previous response is still (or resumed) generating — wait HERE.
+            // Never enter GENERATING/STABILIZING before this item is sent:
+            // that used to harvest the previous chapter's text under this
+            // item's number.
+            if (!item.waitLogged) { item.waitLogged = true; log('Page is still generating; waiting…'); }
             break;
           }
+          maybeResavePrev();
           // resumed after a pause during which the response already finished:
           // don't re-send, just wrap up the current item
-          if (item.status === 'running' && assistantCount() > state.baselineAssistantCount) {
+          if (item.status === 'running' && newAssistantArrived()) {
             setPhase(PHASE.STABILIZING);
             break;
           }
           state.baselineAssistantCount = assistantCount();
           state.baselineUserCount = userCount();
+          state.baselineAssistantKey = lastAssistantKey();
+          state.baselineUserKey = lastUserKey();
           item.status = 'running';
           item.startedAt = now();
           state.promptStartedAt = now();
@@ -735,7 +798,7 @@
       }
 
       case PHASE.SENDING: {
-        if (isGenerating() || assistantCount() > state.baselineAssistantCount) {
+        if (isGenerating() || newAssistantArrived()) {
           state.sendRetries = 0;
           setPhase(PHASE.GENERATING);
           break;
@@ -744,7 +807,7 @@
         // the chat) — NEVER click or re-send after this point. A slow model
         // start (big PDFs, long thinking) used to trip the 25s retry below
         // and send the same "go N" twice, derailing the whole queue.
-        if (userCount() > state.baselineUserCount) {
+        if (promptLeftComposer()) {
           if (now() - state.promptStartedAt > settings.timeoutMin * 60000) {
             failRun(`Prompt exceeded the ${settings.timeoutMin} min timeout`);
           }
@@ -788,11 +851,17 @@
 
       case PHASE.STABILIZING: {
         if (isGenerating()) { setPhase(PHASE.GENERATING); break; } // it resumed (tool use, multi-step)
-        if (inPhase >= settings.stableSec * 1000) {
-          // no response node yet — the model hasn't actually answered (it may
+        // the response text must also STOP GROWING for the settle window —
+        // the stop button alone disappears during mid-answer stalls, which
+        // used to harvest half-written chapters
+        const curLen = lastAssistantText().length;
+        if (curLen !== state.stabLen) { state.stabLen = curLen; state.stabLenAt = now(); }
+        if (inPhase >= settings.stableSec * 1000 &&
+            now() - state.stabLenAt >= settings.stableSec * 1000) {
+          // no response yet — the model hasn't actually answered (it may
           // still be thinking without visible streaming). Don't complete on a
           // stale previous response; keep waiting up to the Max min timeout.
-          if (assistantCount() <= state.baselineAssistantCount) {
+          if (!newAssistantArrived()) {
             if (now() - state.promptStartedAt > settings.timeoutMin * 60000) {
               failRun(`Prompt exceeded the ${settings.timeoutMin} min timeout`);
             }
@@ -824,6 +893,7 @@
             }
             validateChapter(item, full, panels);
             saveChapter(item.n, panels);
+            state.lastHarvest = { n: item.n, len: panels.length, key: lastAssistantKey() };
           }
           completeCurrentItem();
         }
