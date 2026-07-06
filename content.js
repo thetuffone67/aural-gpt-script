@@ -21,7 +21,9 @@
   const SELECTORS = {
     editor: '#prompt-textarea, div[contenteditable="true"].ProseMirror, div[role="textbox"]',
     sendBtn: 'button[data-testid="send-button"], #composer-submit-button, button[aria-label="Send prompt"]',
-    stopBtn: 'button[data-testid="stop-button"], button[aria-label="Stop streaming"], button[aria-label="Stop generating"]',
+    stopBtn: 'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
+      '#composer-submit-button[aria-label*="top"], main button[aria-label*="Stop" i], ' +
+      'button[aria-label="Stop streaming"], button[aria-label="Stop generating"]',
     assistantMsg: 'div[data-message-author-role="assistant"]',
     assistantMsgFallback: 'div[data-message-id] div.markdown',
     userMsg: 'div[data-message-author-role="user"]',
@@ -871,12 +873,23 @@
             const full = lastAssistantText();
             const panels = extractPanels(full);
             if (!panels) {
+              // A "finished" response with no panels is usually a model that
+              // is STILL WORKING (thinking phase shows a quiet message before
+              // the script streams in). Watch it for a long grace window —
+              // re-sending too early is how "go 1" went out twice.
+              const graceMs = Math.max(20, settings.stableSec * 10) * 1000;
+              if (!item.noPanelsSince) {
+                item.noPanelsSince = now();
+                log(`Chapter ${item.n}: response has no [Panel ...] lines yet — watching it for ${Math.round(graceMs / 1000)}s before doing anything (the model may still be thinking).`);
+              }
+              if (now() - item.noPanelsSince < graceMs) break; // keep watching
+              item.noPanelsSince = 0;
               // don't stop the world: retry this chapter once automatically,
               // then skip it and keep the queue moving (it shows up in the
               // book status as missing — re-run just that number later)
               item.harvestRetries = (item.harvestRetries || 0) + 1;
               if (item.harvestRetries <= 1) {
-                log(`⚠️ Chapter ${item.n}: response has no [Panel ...] lines — auto-retrying this chapter once.`);
+                log(`⚠️ Chapter ${item.n}: still no [Panel ...] lines after the grace window — re-sending this chapter once.`);
                 item.status = 'pending';
                 state.sendRetries = 0;
                 setPhase(PHASE.DELAY);
@@ -891,6 +904,7 @@
               else { state.sendRetries = 0; setPhase(PHASE.DELAY); }
               break;
             }
+            item.noPanelsSince = 0;
             validateChapter(item, full, panels);
             saveChapter(item.n, panels);
             state.lastHarvest = { n: item.n, len: panels.length, key: lastAssistantKey() };
