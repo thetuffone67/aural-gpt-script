@@ -114,6 +114,11 @@
     assignment: null, // { s, e } chapter range assigned to this tab
   };
 
+  function settingsFingerprint() {
+    return JSON.stringify([settings.mode, settings.template, settings.rangeStart,
+      settings.rangeEnd, settings.list, settings.sendSetupFirst]);
+  }
+
   const STATE_KEY = 'cgqrState';
   const ASSIGN_KEY = 'cgqrAssign';
 
@@ -123,6 +128,7 @@
         queue: state.queue,
         idx: state.idx,
         phase: state.phase,
+        queueFp: state.queueFp,
       }));
     } catch {}
   }
@@ -135,6 +141,7 @@
       if (!saved.queue || !saved.queue.length) return false;
       state.queue = saved.queue;
       state.idx = saved.idx;
+      state.queueFp = saved.queueFp;
       state.phase = saved.phase === PHASE.FINISHED ? PHASE.FINISHED : PHASE.IDLE;
       state.paused = true;
       if (state.queue[state.idx] && state.queue[state.idx].status === 'running') {
@@ -356,17 +363,19 @@
     return fullText.slice(m.index).trim();
   }
 
+  // warnings only — the queue must keep moving on its own. The response is
+  // saved under the chapter number that was ASKED for, so the book order is
+  // always go 10, 11, 12… even when the model labels its answer differently
+  // (it often numbers by file order within the tab's PDFs).
   function validateChapter(item, fullText, panels) {
-    if (!panels) return 'response has no [Panel ...] lines';
     const hm = fullText.match(/Chapter:\s*(\d+)/i);
     if (item.n != null && hm && parseInt(hm[1], 10) !== item.n) {
-      return `response says Chapter ${hm[1]} but this prompt asked for chapter ${item.n}`;
+      log(`⚠️ Chapter ${item.n}: the response header says "Chapter ${hm[1]}" — saved as chapter ${item.n} anyway (kept queue order).`);
     }
     const nums = [...panels.matchAll(/\[Panel\s*(\d+)\]/gi)].map(x => parseInt(x[1], 10));
     for (let i = 0; i < nums.length; i++) {
       if (nums[i] !== i + 1) { log(`Note: panel numbering jumps at [Panel ${nums[i]}] (kept anyway).`); break; }
     }
-    return null;
   }
 
   function saveChapter(n, text, cb) {
@@ -546,6 +555,7 @@
 
     settings.sendSetupFirst = true;
     state.queue = buildQueue();
+    state.queueFp = settingsFingerprint();
     state.idx = 0;
     if (!state.queue.length) { log('Nothing to queue.'); return; }
     state.paused = false;
@@ -600,6 +610,7 @@
   function startRun(fresh) {
     if (fresh) {
       state.queue = buildQueue();
+      state.queueFp = settingsFingerprint();
       state.idx = 0;
       if (!state.queue.length) { log('Nothing to queue — check your template/list.'); return; }
     }
@@ -610,7 +621,11 @@
     state.sendRetries = 0;
     setPhase(PHASE.DELAY);
     state.phaseSince = now() - settings.delaySec * 1000;
-    log(fresh ? `Started queue: ${state.queue.length} prompts.` : 'Resumed.');
+    if (fresh) {
+      const chaps = state.queue.filter(q => !q.isSetup);
+      const plan = chaps.length ? ` (${chaps[0].text} → ${chaps[chaps.length - 1].text})` : '';
+      log(`Started queue: ${state.queue.length} prompts${plan}.`);
+    } else log('Resumed.');
     persistState();
     updateUI();
   }
@@ -786,8 +801,28 @@
           if (!item.isSetup && settings.harvest) {
             const full = lastAssistantText();
             const panels = extractPanels(full);
-            const err = validateChapter(item, full, panels);
-            if (err) { failRun(`Chapter ${item.n}: ${err}`); break; }
+            if (!panels) {
+              // don't stop the world: retry this chapter once automatically,
+              // then skip it and keep the queue moving (it shows up in the
+              // book status as missing — re-run just that number later)
+              item.harvestRetries = (item.harvestRetries || 0) + 1;
+              if (item.harvestRetries <= 1) {
+                log(`⚠️ Chapter ${item.n}: response has no [Panel ...] lines — auto-retrying this chapter once.`);
+                item.status = 'pending';
+                state.sendRetries = 0;
+                setPhase(PHASE.DELAY);
+                break;
+              }
+              log(`⚠️ Chapter ${item.n}: still no [Panel ...] lines after a retry — skipped. Re-run "go ${item.n}" later; continuing with the next chapter.`);
+              beep();
+              item.status = 'error';
+              state.idx++;
+              persistState();
+              if (state.idx >= state.queue.length) finishRun();
+              else { state.sendRetries = 0; setPhase(PHASE.DELAY); }
+              break;
+            }
+            validateChapter(item, full, panels);
             saveChapter(item.n, panels);
           }
           completeCurrentItem();
@@ -1053,10 +1088,15 @@
     body.appendChild(el('div', { class: 'cgqr-controls cgqr-controls-main' }, startBtn, pauseBtn, skipBtn, resetBtn));
 
     startBtn.addEventListener('click', () => {
-      if (state.queue.length && state.idx < state.queue.length &&
-          state.phase !== PHASE.FINISHED) {
+      const resumable = state.queue.length && state.idx < state.queue.length &&
+          state.phase !== PHASE.FINISHED;
+      // if the range/template changed since this queue was built, resuming
+      // would send stale prompts (e.g. an old "go 2" after "go 10") —
+      // rebuild from what's on screen instead
+      if (resumable && state.queueFp === settingsFingerprint()) {
         startRun(false);
       } else {
+        if (resumable) log('Range/template changed — starting a fresh queue from the current settings.');
         startRun(true);
       }
     });
