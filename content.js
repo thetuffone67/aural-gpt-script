@@ -24,6 +24,7 @@
     stopBtn: 'button[data-testid="stop-button"], button[aria-label="Stop streaming"], button[aria-label="Stop generating"]',
     assistantMsg: 'div[data-message-author-role="assistant"]',
     assistantMsgFallback: 'div[data-message-id] div.markdown',
+    userMsg: 'div[data-message-author-role="user"]',
     fileInput: 'input[type="file"]',
   };
 
@@ -35,6 +36,7 @@
     return primary.length ? primary : $$(SELECTORS.assistantMsgFallback);
   };
   const assistantCount = () => assistantNodes().length;
+  const userCount = () => $$(SELECTORS.userMsg).length;
   const lastAssistantText = () => {
     const nodes = assistantNodes();
     return nodes.length ? (nodes[nodes.length - 1].innerText || '') : '';
@@ -105,7 +107,9 @@
     phaseSince: 0,
     sendRetries: 0,
     enterTried: false,
+    lastClickAt: 0,
     baselineAssistantCount: 0,
+    baselineUserCount: 0,
     promptStartedAt: 0,
     assignment: null, // { s, e } chapter range assigned to this tab
   };
@@ -694,6 +698,7 @@
             break;
           }
           state.baselineAssistantCount = assistantCount();
+          state.baselineUserCount = userCount();
           item.status = 'running';
           item.startedAt = now();
           state.promptStartedAt = now();
@@ -720,8 +725,21 @@
           setPhase(PHASE.GENERATING);
           break;
         }
-        // keep trying to click send (button enables after text insert / uploads finish)
-        const clicked = clickSend();
+        // the prompt already left the composer (a new user message exists in
+        // the chat) — NEVER click or re-send after this point. A slow model
+        // start (big PDFs, long thinking) used to trip the 25s retry below
+        // and send the same "go N" twice, derailing the whole queue.
+        if (userCount() > state.baselineUserCount) {
+          if (now() - state.promptStartedAt > settings.timeoutMin * 60000) {
+            failRun(`Prompt exceeded the ${settings.timeoutMin} min timeout`);
+          }
+          break;
+        }
+        // keep trying to click send (button enables after text insert /
+        // uploads finish) — but at most one successful click per 1.5s so a
+        // briefly-still-enabled button can't be double-clicked
+        const clicked = (now() - state.lastClickAt > 1500) && clickSend();
+        if (clicked) state.lastClickAt = now();
         if (!clicked && inPhase > 5000 && !state.enterTried && !item.isSetup) {
           state.enterTried = true;
           if (pressEnterToSend()) log('Send button not found — trying Enter key fallback.');
@@ -730,7 +748,7 @@
         if (inPhase > startTimeout) {
           if (state.sendRetries < MAX_SEND_RETRIES) {
             state.sendRetries++;
-            log(`Generation didn't start — retry ${state.sendRetries}/${MAX_SEND_RETRIES}…`);
+            log(`Message never left the composer — retry ${state.sendRetries}/${MAX_SEND_RETRIES}…`);
             setPhase(PHASE.INSERTING);
             insertPromptAsync(item.text, (ok) => {
               if (state.phase !== PHASE.INSERTING) return;
@@ -738,7 +756,7 @@
               setPhase(PHASE.SENDING);
             });
           } else {
-            failRun('Prompt was sent but generation never started');
+            failRun('The prompt could not be sent');
           }
         }
         break;
@@ -756,6 +774,15 @@
       case PHASE.STABILIZING: {
         if (isGenerating()) { setPhase(PHASE.GENERATING); break; } // it resumed (tool use, multi-step)
         if (inPhase >= settings.stableSec * 1000) {
+          // no response node yet — the model hasn't actually answered (it may
+          // still be thinking without visible streaming). Don't complete on a
+          // stale previous response; keep waiting up to the Max min timeout.
+          if (assistantCount() <= state.baselineAssistantCount) {
+            if (now() - state.promptStartedAt > settings.timeoutMin * 60000) {
+              failRun(`Prompt exceeded the ${settings.timeoutMin} min timeout`);
+            }
+            break;
+          }
           if (!item.isSetup && settings.harvest) {
             const full = lastAssistantText();
             const panels = extractPanels(full);
