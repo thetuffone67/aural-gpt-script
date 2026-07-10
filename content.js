@@ -500,7 +500,20 @@
   }
 
   function clearBook() {
-    if (!window.confirm('Delete all saved chapters from the book? This cannot be undone.')) return;
+    // native confirm() freezes automation and blocks the tab's input queue —
+    // use a two-click arm instead: first click arms for 5s, second click wipes
+    if (!clearBook.armed) {
+      clearBook.armed = true;
+      if (ui.clearBtn) ui.clearBtn.textContent = 'Sure?';
+      log('Clear pressed — press again within 5s to delete all saved chapters.');
+      setTimeout(() => {
+        clearBook.armed = false;
+        if (ui.clearBtn) ui.clearBtn.textContent = 'Clear';
+      }, 5000);
+      return;
+    }
+    clearBook.armed = false;
+    if (ui.clearBtn) ui.clearBtn.textContent = 'Clear';
     try {
       chrome.storage.local.get(null, (all) => {
         const keys = Object.keys(all).filter(k => k.startsWith(CHAP_PREFIX));
@@ -1249,6 +1262,7 @@
     const dlBtn = el('button', { class: 'cgqr-btn', text: 'Download' });
     dlBtn.addEventListener('click', downloadBook);
     const clearBtn = el('button', { class: 'cgqr-btn cgqr-btn-danger', text: 'Clear' });
+    ui.clearBtn = clearBtn;
     clearBtn.addEventListener('click', clearBook);
     body.appendChild(el('div', { class: 'cgqr-card cgqr-book' },
       el('label', { class: 'cgqr-label', text: 'Book script' }),
