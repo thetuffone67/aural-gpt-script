@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Aural GPT Script",
-  "version": "1.1.7",
-  "description": "Auto-run manhwa recap scripts on chatgpt.com: queues go 1..go N chapter prompts, harvests every [Panel] script into one ordered book, and runs batches in parallel tabs.",
+  "name": "Aural Chapter Desk",
+  "version": "2.2.1",
+  "description": "A send-once chapter runner for ChatGPT with a shared Script Vault and batch tabs.",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",

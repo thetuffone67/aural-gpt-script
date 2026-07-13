@@ -1,1356 +1,751 @@
-/* AURAL GPT Script — manhwa recap runner
- * Queues "go N" prompts on chatgpt.com, auto-sends the next the instant the
- * previous response finishes, harvests the [Panel ...] script from every
- * chapter into one ordered book file, and can split a book across multiple
- * tabs to generate chapters in parallel.
- */
+/* Aural Chapter Desk — deliberately simple, send-once ChatGPT runner. */
 (() => {
   'use strict';
+  if (window.__auralChapterDesk) return;
+  window.__auralChapterDesk = true;
 
-  if (window.__cgqrLoaded) return;
-  window.__cgqrLoaded = true;
-
-  // captured before ChatGPT's router can touch the URL
   const INITIAL_HASH = location.hash || '';
-
-  // ---------------------------------------------------------------- helpers
-
-  const $ = (sel, root = document) => root.querySelector(sel);
-  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
-
-  const SELECTORS = {
-    editor: '#prompt-textarea, div[contenteditable="true"].ProseMirror, div[role="textbox"]',
-    sendBtn: 'button[data-testid="send-button"], #composer-submit-button, button[aria-label="Send prompt"]',
-    stopBtn: 'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
-      '#composer-submit-button[aria-label*="top"], main button[aria-label*="Stop" i], ' +
-      'button[aria-label="Stop streaming"], button[aria-label="Stop generating"]',
-    assistantMsg: 'div[data-message-author-role="assistant"]',
-    assistantMsgFallback: 'div[data-message-id] div.markdown',
-    userMsg: 'div[data-message-author-role="user"]',
-    fileInput: 'input[type="file"]',
-  };
-
-  const getEditor = () => $(SELECTORS.editor);
-  const getSendBtn = () => $(SELECTORS.sendBtn);
-  const isGenerating = () => !!$(SELECTORS.stopBtn);
-  const assistantNodes = () => {
-    const primary = $$(SELECTORS.assistantMsg);
-    return primary.length ? primary : $$(SELECTORS.assistantMsgFallback);
-  };
-  const assistantCount = () => assistantNodes().length;
-  const userCount = () => $$(SELECTORS.userMsg).length;
-  const lastAssistantText = () => {
-    const nodes = assistantNodes();
-    return nodes.length ? (nodes[nodes.length - 1].innerText || '') : '';
-  };
-
-  // Long chats get VIRTUALIZED: ChatGPT unmounts old messages, so message
-  // COUNTS stop growing even though new responses arrive. Identify the last
-  // message by its id instead — counts are only kept as a fallback signal.
-  const nodeKey = (n) => {
-    if (!n) return '';
-    const id = n.getAttribute('data-message-id') ||
-      (n.closest('[data-message-id]') || {}).getAttribute?.('data-message-id');
-    if (id) return 'id:' + id;
-    const t = n.textContent || '';
-    return 'tx:' + t.length + ':' + t.slice(0, 40) + ':' + t.slice(-40);
-  };
-  const lastAssistantKey = () => {
-    const nodes = assistantNodes();
-    return nodes.length ? nodeKey(nodes[nodes.length - 1]) : '';
-  };
-  const lastUserKey = () => {
-    const nodes = $$(SELECTORS.userMsg);
-    return nodes.length ? nodeKey(nodes[nodes.length - 1]) : '';
-  };
-  const newAssistantArrived = () =>
-    assistantCount() > state.baselineAssistantCount ||
-    (lastAssistantKey() !== '' && lastAssistantKey() !== state.baselineAssistantKey);
-  const promptLeftComposer = () =>
-    userCount() > state.baselineUserCount ||
-    (lastUserKey() !== '' && lastUserKey() !== state.baselineUserKey);
-
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const now = () => Date.now();
-  const fmtDur = (ms) => {
-    const s = Math.floor(ms / 1000);
-    const m = Math.floor(s / 60);
-    return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
-  };
-
-  // ---------------------------------------------------------------- settings
+  const SETTINGS_KEY = 'auralDeskSettings';
+  const RUN_KEY = 'auralDeskRun';
+  const ASSIGNMENT_KEY = 'auralDeskAssignment';
+  const CHAPTER_KEY = 'auralDeskChapter_';
+  const LEGACY_CHAPTER_KEY = 'cgqrChap_';
+  const FOLDER_DB = 'auralChapterDeskFiles';
+  const FOLDER_STORE = 'handles';
+  const FOLDER_RECORD = 'selected-pdf-folder';
 
   const DEFAULTS = {
-    mode: 'template',          // 'template' | 'list'
-    template: 'go {n}',
-    rangeStart: 1,
-    rangeEnd: 20,
-    list: '',
-    delaySec: 3,               // pause after a response completes, before next send
-    stableSec: 6,              // generation must stay stopped this long to count as done
-    timeoutMin: 25,            // max time for one prompt before pausing the queue
-    harvest: true,             // extract [Panel ...] script from each chapter
-    beepWhenDone: true,
-    sendSetupFirst: false,     // send master prompt + link + sample as message #1
-    tabCount: 3,
-    masterPrompt: '',
-    bookLink: '',
-    styleSample: '',
+    template: 'go {n}', start: 1, end: 20, harvest: true, sendSetup: false, masterPrompt: '', bookLinks: ['', '', '', '', ''],
+    styleSample: '', tabCount: 3, folderAutomation: false, folderName: '',
   };
-
   let settings = { ...DEFAULTS };
-
-  function loadSettings(cb) {
-    try {
-      chrome.storage.local.get({ cgqrSettings: DEFAULTS }, (res) => {
-        settings = { ...DEFAULTS, ...res.cgqrSettings };
-        cb();
-      });
-    } catch {
-      cb();
-    }
-  }
-
-  function saveSettings() {
-    try { chrome.storage.local.set({ cgqrSettings: settings }); } catch {}
-  }
-
-  // ---------------------------------------------------------------- state
+  let assignment = null;
+  let ui = {};
+  let lastStatus = '';
 
   const PHASE = {
-    IDLE: 'idle',
-    DELAY: 'delay',
-    INSERTING: 'inserting',
-    SENDING: 'sending',
-    GENERATING: 'generating',
-    STABILIZING: 'stabilizing',
-    FINISHED: 'finished',
-    ERROR: 'error',
+    IDLE: 'idle', COOLDOWN: 'cooldown', TYPING: 'typing', READY: 'ready',
+    SENT: 'sent', WRITING: 'writing', SETTLING: 'settling', PAUSED: 'paused', DONE: 'done',
   };
 
-  let state = {
-    queue: [],        // [{ text, n, isSetup, status, startedAt, elapsedMs }]
-    idx: 0,
-    phase: PHASE.IDLE,
-    paused: true,
-    phaseSince: 0,
-    sendRetries: 0,
-    enterTried: false,
-    lastClickAt: 0,
-    baselineAssistantCount: 0,
-    baselineUserCount: 0,
-    baselineAssistantKey: '',
-    baselineUserKey: '',
-    stabLen: -1,
-    stabLenAt: 0,
-    lastHarvest: null, // { n, len } — last chapter saved, for post-stall re-save
-    promptStartedAt: 0,
-    assignment: null, // { s, e } chapter range assigned to this tab
+  const state = {
+    items: [], activeId: null, phase: PHASE.IDLE, paused: true, phaseAt: now(),
+    baselineAssistant: '', baselineUser: '', stableLength: -1, stableAt: 0,
+    assignment: null, selectedChapterNumbers: null,
   };
+  // These are internal safeguards, not settings the user has to tune. A
+  // response must be visibly quiet for a moment after ChatGPT drops its Stop
+  // button; then the next chapter starts automatically.
+  const AUTO_QUIET_MS = 2500;
+  const NEXT_CHAPTER_MS = 750;
+  const MAX_AUTO_PDFS_PER_TAB = 12;
 
-  function settingsFingerprint() {
-    return JSON.stringify([settings.mode, settings.template, settings.rangeStart,
-      settings.rangeEnd, settings.list, settings.sendSetupFirst]);
+  // ---- ChatGPT page adapters ------------------------------------------------
+
+  const selectors = {
+    editor: '#prompt-textarea, div[contenteditable="true"].ProseMirror, div[role="textbox"]',
+    send: 'button[data-testid="send-button"], #composer-submit-button, button[aria-label="Send prompt"]',
+    stop: 'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], button[aria-label="Stop streaming"], button[aria-label="Stop generating"]',
+    assistant: 'div[data-message-author-role="assistant"]',
+    user: 'div[data-message-author-role="user"]',
+    file: 'input[type="file"]',
+  };
+  const editor = () => $(selectors.editor);
+  const sendButton = () => $(selectors.send);
+  const isGenerating = () => !!$(selectors.stop);
+  const assistants = () => {
+    const found = $$(selectors.assistant);
+    return found.length ? found : $$('div[data-message-id] div.markdown');
+  };
+  const users = () => $$(selectors.user);
+  const chatFileInput = () => {
+    const inputs = $$(selectors.file).filter(input => !input.closest('#aural-desk'));
+    return inputs.find(input => input.id === 'upload-files') ||
+      inputs.find(input => (input.accept || '').toLowerCase().includes('pdf')) || inputs[0] || null;
+  };
+  const nodeKey = (node) => {
+    if (!node) return '';
+    const id = node.getAttribute('data-message-id') || node.closest('[data-message-id]')?.getAttribute('data-message-id');
+    if (id) return `id:${id}`;
+    const text = node.innerText || '';
+    return `text:${text.length}:${text.slice(0, 60)}:${text.slice(-60)}`;
+  };
+  const lastAssistant = () => assistants().at(-1);
+  const lastUser = () => users().at(-1);
+  const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
+
+  function captureBaseline() {
+    state.baselineAssistant = nodeKey(lastAssistant());
+    state.baselineUser = nodeKey(lastUser());
+    state.stableLength = -1;
+    state.stableAt = 0;
   }
-
-  const STATE_KEY = 'cgqrState';
-  const ASSIGN_KEY = 'cgqrAssign';
-
-  function persistState() {
+  function promptLeftComposer() {
+    const key = nodeKey(lastUser());
+    return !!key && key !== state.baselineUser;
+  }
+  function latestUserIs(item) {
+    return !!item && clean(lastUser()?.innerText).includes(clean(item.prompt));
+  }
+  function responseVisible(item) {
+    const assistant = lastAssistant();
+    if (!assistant) return false;
+    if (nodeKey(assistant) !== state.baselineAssistant) return true;
+    const user = lastUser();
+    return !!(item?.sentOnce && user && latestUserIs(item) &&
+      (user.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING));
+  }
+  function insertText(text) {
+    const box = editor();
+    if (!box) return false;
     try {
-      sessionStorage.setItem(STATE_KEY, JSON.stringify({
-        queue: state.queue,
-        idx: state.idx,
-        phase: state.phase,
-        queueFp: state.queueFp,
-      }));
+      box.focus();
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(box);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const data = new DataTransfer();
+      data.setData('text/plain', text);
+      box.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+      if (clean(box.innerText).includes(clean(text).slice(0, 50))) return true;
     } catch {}
-  }
-
-  function restoreState() {
     try {
-      const raw = sessionStorage.getItem(STATE_KEY);
-      if (!raw) return false;
-      const saved = JSON.parse(raw);
-      if (!saved.queue || !saved.queue.length) return false;
-      state.queue = saved.queue;
-      state.idx = saved.idx;
-      state.queueFp = saved.queueFp;
-      state.phase = saved.phase === PHASE.FINISHED ? PHASE.FINISHED : PHASE.IDLE;
-      state.paused = true;
-      if (state.queue[state.idx] && state.queue[state.idx].status === 'running') {
-        state.queue[state.idx].status = 'pending';
-      }
-      return true;
+      box.focus();
+      // Keep the selection inside the composer. document.execCommand('selectAll')
+      // can select the full conversation in a long chat and freeze the tab.
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(box);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.execCommand('insertText', false, text);
+      box.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      return clean(box.innerText).includes(clean(text).slice(0, 50));
     } catch { return false; }
   }
 
-  function loadAssignment() {
-    const m = INITIAL_HASH.match(/#cgqr=(\d+)-(\d+)/);
-    if (m) {
-      state.assignment = { s: parseInt(m[1], 10), e: parseInt(m[2], 10) };
-      try { sessionStorage.setItem(ASSIGN_KEY, JSON.stringify(state.assignment)); } catch {}
-      try { history.replaceState(null, '', location.pathname + location.search); } catch {}
-      return;
-    }
+  // ---- persistence ----------------------------------------------------------
+
+  function readSettings(done) {
     try {
-      const raw = sessionStorage.getItem(ASSIGN_KEY);
-      if (raw) state.assignment = JSON.parse(raw);
+      chrome.storage.local.get([SETTINGS_KEY, 'cgqrSettings'], data => {
+        const saved = data[SETTINGS_KEY] || {};
+        const old = data.cgqrSettings || {};
+        // Migrate the old Aural GPT Script form, so a rebuild never makes the
+        // user re-paste a huge master prompt, book link, or style sample.
+        const migrated = {
+          template: old.template, start: old.rangeStart, end: old.rangeEnd,
+          harvest: old.harvest, sendSetup: old.sendSetupFirst, masterPrompt: old.masterPrompt,
+          bookLinks: old.bookLink ? [old.bookLink, '', '', '', ''] : undefined, styleSample: old.styleSample, tabCount: old.tabCount,
+        };
+        Object.keys(migrated).forEach(key => migrated[key] === undefined && delete migrated[key]);
+        settings = { ...DEFAULTS, ...migrated, ...saved };
+        // Migrate v2.0's one Book link field to the new five-link list.
+        if (!Array.isArray(settings.bookLinks)) settings.bookLinks = [saved.bookLink || old.bookLink || '', '', '', '', ''];
+        settings.bookLinks = Array.from({ length: 5 }, (_, index) => settings.bookLinks[index] || '');
+        // Keep the one-field setup message from the first v2 build as the
+        // master prompt when upgrading to the restored Book Setup form.
+        if (!settings.masterPrompt && saved.setup) settings.masterPrompt = saved.setup;
+        done();
+      });
+    }
+    catch { done(); }
+  }
+  function saveSettings() { try { chrome.storage.local.set({ [SETTINGS_KEY]: settings }); } catch {} }
+  function openFolderDb() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(FOLDER_DB, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore(FOLDER_STORE);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+  async function storeFolderHandle(handle) {
+    const db = await openFolderDb();
+    await new Promise((resolve, reject) => {
+      const request = db.transaction(FOLDER_STORE, 'readwrite').objectStore(FOLDER_STORE).put(handle, FOLDER_RECORD);
+      request.onsuccess = resolve; request.onerror = () => reject(request.error);
+    });
+    db.close();
+  }
+  async function getFolderHandle() {
+    const db = await openFolderDb();
+    const handle = await new Promise((resolve, reject) => {
+      const request = db.transaction(FOLDER_STORE).objectStore(FOLDER_STORE).get(FOLDER_RECORD);
+      request.onsuccess = () => resolve(request.result || null); request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return handle;
+  }
+  async function folderPermission(handle, canAsk) {
+    const options = { mode: 'read' };
+    if (await handle.queryPermission(options) === 'granted') return true;
+    return canAsk && await handle.requestPermission(options) === 'granted';
+  }
+  async function pdfFilesFromFolder(handle) {
+    const files = [];
+    for await (const entry of handle.values()) {
+      if (entry.kind !== 'file' || !/\.pdf$/i.test(entry.name)) continue;
+      files.push(await entry.getFile());
+    }
+    return files;
+  }
+  function persistRun() {
+    try {
+      sessionStorage.setItem(RUN_KEY, JSON.stringify({ items: state.items, activeId: state.activeId, assignment: state.assignment, selectedChapterNumbers: state.selectedChapterNumbers }));
     } catch {}
   }
-
-  function adoptAssignment() {
-    if (!state.assignment) return;
-    // in-memory only: each tab keeps its own range without clobbering the
-    // shared settings other tabs read
-    settings.rangeStart = state.assignment.s;
-    settings.rangeEnd = state.assignment.e;
+  function restoreRun() {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(RUN_KEY) || 'null');
+      if (!saved?.items?.length) return false;
+      state.items = saved.items;
+      state.activeId = saved.activeId;
+      state.assignment = saved.assignment || assignment;
+      state.selectedChapterNumbers = saved.selectedChapterNumbers || null;
+      state.phase = PHASE.PAUSED;
+      state.paused = true;
+      return true;
+    } catch { return false; }
+  }
+  function saveChapter(number, text) {
+    try { chrome.storage.local.set({ [CHAPTER_KEY + number]: { number, text, savedAt: now() } }, updateBook); } catch {}
+  }
+  function getBook(done) {
+    try {
+      chrome.storage.local.get(null, all => {
+        // Keep scripts generated by the old extension version visible in the
+        // new vault. New entries win if the same chapter exists in both.
+        const byNumber = new Map();
+        Object.keys(all).filter(key => key.startsWith(LEGACY_CHAPTER_KEY)).forEach(key => {
+          const value = all[key];
+          if (value?.text && Number.isFinite(value.n)) byNumber.set(value.n, { number: value.n, text: value.text, savedAt: value.at });
+        });
+        Object.keys(all).filter(key => key.startsWith(CHAPTER_KEY)).forEach(key => {
+          const value = all[key];
+          if (value?.text && Number.isFinite(value.number)) byNumber.set(value.number, value);
+        });
+        done([...byNumber.values()].sort((a, b) => a.number - b.number));
+      });
+    } catch { done([]); }
   }
 
-  // ---------------------------------------------------------------- queue building
+  // ---- queue and batch assignment ------------------------------------------
 
-  function chapterNumFromName(name) {
-    let m = name.match(/chapter[\s_\-]*(\d+)/i);
-    if (m) return parseInt(m[1], 10);
-    m = name.match(/(\d+)/);
-    return m ? parseInt(m[1], 10) : null;
-  }
-
-  function chapterNumberFromText(text, fallback) {
-    const m = text.match(/(\d+)\s*$/);
-    return m ? parseInt(m[1], 10) : fallback;
-  }
-
-  function buildQueue(chapterNums) {
-    const items = [];
-    if (chapterNums && chapterNums.length) {
-      chapterNums.forEach(n =>
-        items.push({ text: settings.template.replaceAll('{n}', String(n)), n, status: 'pending', elapsedMs: 0 }));
-    } else if (settings.mode === 'template') {
-      const start = Math.min(settings.rangeStart, settings.rangeEnd);
-      const end = Math.max(settings.rangeStart, settings.rangeEnd);
-      for (let n = start; n <= end; n++) {
-        items.push({ text: settings.template.replaceAll('{n}', String(n)), n, status: 'pending', elapsedMs: 0 });
-      }
+  function loadAssignment() {
+    const match = INITIAL_HASH.match(/#aural=(\d+)-(\d+)/);
+    if (match) {
+      assignment = { start: +match[1], end: +match[2] };
+      try { sessionStorage.setItem(ASSIGNMENT_KEY, JSON.stringify(assignment)); } catch {}
+      history.replaceState(null, '', location.pathname + location.search);
     } else {
-      settings.list.split('\n').map(s => s.trim()).filter(Boolean)
-        .forEach((t, i) => items.push({ text: t, n: chapterNumberFromText(t, i + 1), status: 'pending', elapsedMs: 0 }));
+      try { assignment = JSON.parse(sessionStorage.getItem(ASSIGNMENT_KEY) || 'null'); } catch {}
     }
-    if (settings.sendSetupFirst) {
-      const setup = composeSetup();
-      if (setup) items.unshift({ text: setup, isSetup: true, status: 'pending', elapsedMs: 0 });
-      else log('Setup-first is on but the Book setup fields are empty — skipping setup message.');
+    state.assignment = assignment;
+  }
+  function rangeForThisTab() {
+    if (state.assignment) return state.assignment;
+    return { start: Math.min(settings.start, settings.end), end: Math.max(settings.start, settings.end) };
+  }
+  function composeBookSetup() {
+    const parts = [];
+    if (settings.masterPrompt.trim()) parts.push(settings.masterPrompt.trim());
+    const links = settings.bookLinks.map(link => link.trim()).filter(Boolean);
+    if (links.length) parts.push(`BOOK LINKS — use any working link for story context:\n${links.map((link, index) => `${index + 1}. ${link}`).join('\n')}`);
+    if (settings.styleSample.trim()) parts.push(`STYLE SAMPLE:\n${settings.styleSample.trim()}`);
+    return parts.join('\n\n');
+  }
+  function chapterNumberFromFileName(name) {
+    const named = name.match(/(?:chapter|chap|ch)[\s_-]*(\d+)/i);
+    if (named) return +named[1];
+    const numbers = [...name.matchAll(/\d+/g)];
+    return numbers.length ? +numbers.at(-1)[0] : null;
+  }
+  function makeQueue() {
+    const range = rangeForThisTab();
+    const items = [];
+    const setup = composeBookSetup();
+    if (settings.sendSetup && setup) items.push({ id: 'setup', label: 'Book setup', prompt: setup, setup: true, status: 'queued', attempts: 0 });
+    const numbers = state.selectedChapterNumbers?.length
+      ? state.selectedChapterNumbers
+      : Array.from({ length: range.end - range.start + 1 }, (_, index) => range.start + index);
+    for (const number of numbers) {
+      items.push({ id: `chapter-${number}`, number, label: `Chapter ${number}`, prompt: settings.template.replaceAll('{n}', String(number)), status: 'queued', attempts: 0 });
     }
     return items;
   }
-
-  function composeSetup() {
-    const parts = [];
-    if (settings.masterPrompt.trim()) parts.push(settings.masterPrompt.trim());
-    if (settings.bookLink.trim()) parts.push('Book link for story context: ' + settings.bookLink.trim());
-    if (settings.styleSample.trim()) parts.push('STYLE SAMPLE:\n' + settings.styleSample.trim());
-    return parts.join('\n\n');
+  function beginWithSelectedFiles(files) {
+    const assigned = rangeForThisTab();
+    let numbers = [...new Set(files.map(file => chapterNumberFromFileName(file.name)).filter(Number.isFinite))].sort((a, b) => a - b);
+    // When all PDFs are selected in a batch tab, retain only this tab's slice.
+    const inThisTab = numbers.filter(number => number >= assigned.start && number <= assigned.end);
+    if (state.assignment && inThisTab.length) numbers = inThisTab;
+    state.selectedChapterNumbers = numbers.length ? numbers : null;
+    if (numbers.length) note(`ChatGPT is uploading ${files.length} PDFs. This tab will run chapters ${numbers.join(', ')}.`);
+    else note(`ChatGPT is uploading ${files.length} PDFs. Filenames had no chapter numbers, so this tab will run ${assigned.start}–${assigned.end}.`);
+    beginFresh();
   }
-
-  // ---------------------------------------------------------------- composer I/O
-
-  // Select only inside the editor. NEVER use document.execCommand('selectAll'):
-  // if the editor isn't the active element it selects the whole conversation,
-  // and replacing that selection re-lays-out thousands of nodes — that is what
-  // froze the page ("Page Unresponsive") on long chats.
-  function selectAllInEditor(editor) {
+  function filesForThisTab(files) {
+    if (!state.assignment) return files;
+    const assigned = rangeForThisTab();
+    const matching = files.filter(file => {
+      const number = chapterNumberFromFileName(file.name);
+      return number != null && number >= assigned.start && number <= assigned.end;
+    });
+    return matching.length ? matching : files;
+  }
+  function injectFilesIntoChatGPT(files) {
+    const input = chatFileInput();
+    if (!input || !files.length) return false;
     try {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      return true;
-    } catch { return false; }
-  }
-
-  function insertPrompt(text) {
-    const editor = getEditor();
-    if (!editor) return false;
-    editor.focus();
-    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const landed = () => norm(editor.innerText).includes(norm(text.slice(0, 60)));
-    // synthetic paste keeps line breaks in ProseMirror and is cheap even for
-    // very large master prompts
-    try {
-      selectAllInEditor(editor);
-      const dt = new DataTransfer();
-      dt.setData('text/plain', text);
-      editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-      if (landed()) return true;
-    } catch {}
-    try {
-      // insertText only when the editor really owns focus + selection
-      if (document.activeElement === editor || editor.contains(document.activeElement)) {
-        selectAllInEditor(editor);
-        document.execCommand('insertText', false, text);
-        if (landed()) return true;
-      }
-    } catch {}
-    try {
-      editor.innerHTML = '';
-      text.split('\n').forEach(line => {
-        const p = document.createElement('p');
-        p.textContent = line;
-        editor.appendChild(p);
-      });
-      editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
-      return true;
-    } catch { return false; }
-  }
-
-  // A 70–150KB setup message (master prompt + style sample) inserted in one
-  // synchronous shot blocks the main thread long enough for the browser to
-  // show "Page Unresponsive" — so big text goes in as small chunks, yielding
-  // to the page between chunks.
-  const INSERT_CHUNK = 8000;
-
-  function caretToEnd(editor) {
-    try {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      range.collapse(false);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      return true;
-    } catch { return false; }
-  }
-
-  function insertPromptAsync(text, done) {
-    if (text.length <= INSERT_CHUNK) { done(insertPrompt(text)); return; }
-    const editor = getEditor();
-    if (!editor) { done(false); return; }
-    editor.focus();
-    selectAllInEditor(editor);
-    try { document.execCommand('delete', false, null); } catch {}
-    const chunks = [];
-    for (let i = 0; i < text.length; i += INSERT_CHUNK) chunks.push(text.slice(i, i + INSERT_CHUNK));
-    let i = 0;
-    let usePaste = true;
-    const step = () => {
-      const ed = getEditor();
-      if (!ed) { done(false); return; }
-      ed.focus();
-      caretToEnd(ed);
-      const before = (ed.textContent || '').length;
-      if (usePaste) {
-        try {
-          const dt = new DataTransfer();
-          dt.setData('text/plain', chunks[i]);
-          ed.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-        } catch {}
-      }
-      if ((ed.textContent || '').length <= before) {
-        // paste was ignored — try insertText for this chunk instead
-        usePaste = false;
-        caretToEnd(ed);
-        try { document.execCommand('insertText', false, chunks[i]); } catch {}
-        if ((ed.textContent || '').length <= before) { done(false); return; }
-      }
-      i++;
-      if (i < chunks.length) setTimeout(step, 40);
-      else done(true);
-    };
-    setTimeout(step, 0);
-  }
-
-  function clickSend() {
-    const btn = getSendBtn();
-    if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
-    btn.click();
-    return true;
-  }
-
-  // last-resort send if the send button selector ever breaks: ProseMirror
-  // submits on a plain Enter keydown
-  function pressEnterToSend() {
-    const editor = getEditor();
-    if (!editor || !(editor.innerText || '').trim()) return false;
-    editor.focus();
-    for (const type of ['keydown', 'keyup']) {
-      editor.dispatchEvent(new KeyboardEvent(type, {
-        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
-        bubbles: true, cancelable: true,
-      }));
-    }
-    return true;
-  }
-
-  function getChatGPTFileInput() {
-    const inputs = $$(SELECTORS.fileInput).filter(i => !i.closest('#cgqr-panel'));
-    return inputs.find(i => i.id === 'upload-files') ||
-      inputs.find(i => !i.getAttribute('accept') || (i.accept || '').includes('pdf')) ||
-      inputs[0] || null;
-  }
-
-  function attachFiles(files) {
-    // never target our own panel's file picker — injecting into it re-fires
-    // its change listener and recurses until the tab hangs
-    const inputs = $$(SELECTORS.fileInput).filter(i => !i.closest('#cgqr-panel'));
-    if (!inputs.length) return false;
-    const input = inputs.find(i => (i.accept || '').includes('pdf')) || inputs[0];
-    const dt = new DataTransfer();
-    files.forEach(f => dt.items.add(f));
-    try {
-      input.files = dt.files;
+      const data = new DataTransfer();
+      files.forEach(file => data.items.add(file));
+      input.files = data.files;
       input.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
     } catch { return false; }
   }
-
-  // ---------------------------------------------------------------- harvest / book
-
-  const CHAP_PREFIX = 'cgqrChap_';
-
-  function extractPanels(fullText) {
-    const m = fullText.match(/\[Panel\s*\d+\]/i);
-    if (!m) return null;
-    return fullText.slice(m.index).trim();
-  }
-
-  // warnings only — the queue must keep moving on its own. The response is
-  // saved under the chapter number that was ASKED for, so the book order is
-  // always go 10, 11, 12… even when the model labels its answer differently
-  // (it often numbers by file order within the tab's PDFs).
-  function validateChapter(item, fullText, panels) {
-    const hm = fullText.match(/Chapter:\s*(\d+)/i);
-    if (item.n != null && hm && parseInt(hm[1], 10) !== item.n) {
-      log(`⚠️ Chapter ${item.n}: the response header says "Chapter ${hm[1]}" — saved as chapter ${item.n} anyway (kept queue order).`);
+  async function waitForChatFileInput(maxWaitMs = 20000) {
+    const deadline = now() + maxWaitMs;
+    while (now() < deadline) {
+      const input = chatFileInput();
+      if (input) return input;
+      await new Promise(resolve => setTimeout(resolve, 250));
     }
-    const nums = [...panels.matchAll(/\[Panel\s*(\d+)\]/gi)].map(x => parseInt(x[1], 10));
-    for (let i = 0; i < nums.length; i++) {
-      if (nums[i] !== i + 1) { log(`Note: panel numbering jumps at [Panel ${nums[i]}] (kept anyway).`); break; }
+    return null;
+  }
+  let filePickerArmed = false;
+  function attachPdfsAndBegin() {
+    const input = chatFileInput();
+    if (!input) return note('Could not find ChatGPT’s attachment input. Use ChatGPT’s + button, then press Begin (PDFs attached).');
+    if (!filePickerArmed) {
+      filePickerArmed = true;
+      input.addEventListener('change', () => {
+        filePickerArmed = false;
+        const files = Array.from(input.files || []);
+        if (files.length) beginWithSelectedFiles(files);
+      }, { once: true });
+      setTimeout(() => { filePickerArmed = false; }, 120000);
+    }
+    note('ChatGPT’s file picker is open. Select all PDFs for this tab.');
+    input.click();
+  }
+  function beginWithAlreadyAttachedPdfs() {
+    const files = Array.from(chatFileInput()?.files || []);
+    if (files.length) beginWithSelectedFiles(files);
+    else {
+      state.selectedChapterNumbers = null;
+      beginFresh();
+      note('Started with the configured chapter range.');
     }
   }
-
-  function saveChapter(n, text, cb) {
+  async function autoLoadFolderForThisTab(canAskPermission = false) {
     try {
-      chrome.storage.local.set({ [CHAP_PREFIX + n]: { n, text, at: now() } }, () => {
-        const count = (text.match(/\[Panel\s*\d+\]/gi) || []).length;
-        log(`Saved chapter ${n} to the book (${count} panels).`);
-        updateBookUI();
-        if (cb) cb();
-      });
-    } catch {}
+      const folder = await getFolderHandle();
+      if (!folder) return false;
+      if (!await folderPermission(folder, canAskPermission)) return false;
+      const allFiles = await pdfFilesFromFolder(folder);
+      const files = filesForThisTab(allFiles);
+      if (!files.length) { note('No PDFs were found for this tab’s chapter range.'); return false; }
+      if (files.length > MAX_AUTO_PDFS_PER_TAB) {
+        note(`This tab has ${files.length} PDFs. Split into more batches so each tab has at most ${MAX_AUTO_PDFS_PER_TAB}.`);
+        return false;
+      }
+      if (!await waitForChatFileInput() || !injectFilesIntoChatGPT(files)) { note('ChatGPT’s upload input is not ready. Use Attach PDFs + Begin in this tab.'); return false; }
+      beginWithSelectedFiles(files);
+      note(`Auto-loaded ${files.length} PDFs from “${settings.folderName || folder.name}”.`);
+      return true;
+    } catch (error) {
+      note(`Folder automation needs attention: ${error?.message || 'could not read the folder'}.`);
+      return false;
+    }
   }
-
-  function getBook(cb) {
+  async function chooseFolderAndOpenBatches() {
+    if (!window.showDirectoryPicker) return note('Folder automation requires Chrome or Edge. Use Attach PDFs + Begin instead.');
     try {
-      chrome.storage.local.get(null, (all) => {
-        const chaps = Object.keys(all)
-          .filter(k => k.startsWith(CHAP_PREFIX))
-          .map(k => all[k])
-          .filter(c => c && typeof c.n === 'number' && c.text)
-          .sort((a, b) => a.n - b.n);
-        cb(chaps);
-      });
-    } catch { cb([]); }
+      const folder = await window.showDirectoryPicker({ mode: 'read' });
+      if (!await folderPermission(folder, true)) return note('Folder access was not granted.');
+      const files = await pdfFilesFromFolder(folder);
+      if (!files.length) return note('That folder has no PDF files.');
+      const neededBatches = Math.ceil(files.length / MAX_AUTO_PDFS_PER_TAB);
+      if (settings.tabCount < neededBatches) {
+        settings.tabCount = Math.min(12, neededBatches);
+        saveSettings();
+        note(`Using ${settings.tabCount} batch tabs to keep uploads at ${MAX_AUTO_PDFS_PER_TAB} PDFs or fewer per tab.`);
+      }
+      if (neededBatches > 12) return note(`This folder has ${files.length} PDFs. Use at least ${neededBatches} batches, which is above the current 12-tab safety limit.`);
+      await storeFolderHandle(folder);
+      settings.folderAutomation = true;
+      settings.folderName = folder.name;
+      saveSettings();
+      openBatchTabs();
+      await autoLoadFolderForThisTab(true);
+    } catch (error) {
+      if (error?.name !== 'AbortError') note(`Could not use that folder: ${error?.message || error}`);
+    }
   }
-
-  function buildBookText(chaps) {
-    return chaps.map(c => c.text.trim()).join('\n\n') + '\n';
-  }
-
-  function copyBook() {
-    getBook((chaps) => {
-      if (!chaps.length) { log('No chapters saved yet.'); return; }
-      const text = buildBookText(chaps);
-      const done = () => {
-        log(`Copied full script: ${chaps.length} chapters (${chaps[0].n}–${chaps[chaps.length - 1].n}).`);
-        if (ui.copyBtn) {
-          ui.copyBtn.textContent = '✓ Copied';
-          setTimeout(() => { if (ui.copyBtn) ui.copyBtn.textContent = 'Copy full script'; }, 1800);
-        }
-      };
-      const fallback = () => {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        try { document.execCommand('copy'); done(); } catch { log('Copy failed — use Download instead.'); }
-        ta.remove();
-      };
-      try {
-        navigator.clipboard.writeText(text).then(done, fallback);
-      } catch { fallback(); }
+  function splitRange(start, end, count) {
+    const total = end - start + 1;
+    const tabs = Math.max(1, Math.min(count, total));
+    const base = Math.floor(total / tabs);
+    let extra = total % tabs, current = start;
+    return Array.from({ length: tabs }, () => {
+      const length = base + (extra-- > 0 ? 1 : 0);
+      const part = { start: current, end: current + length - 1 };
+      current += length;
+      return part;
     });
   }
-
-  function downloadBook() {
-    getBook((chaps) => {
-      if (!chaps.length) { log('No chapters saved yet.'); return; }
-      const blob = new Blob([buildBookText(chaps)], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'book-script.txt';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
-      log(`Downloaded book-script.txt (${chaps.length} chapters).`);
-    });
+  function openBatchTabs() {
+    const full = { start: Math.min(settings.start, settings.end), end: Math.max(settings.start, settings.end) };
+    const parts = splitRange(full.start, full.end, settings.tabCount);
+    if (parts.length < 2) return note('Use at least two chapters to open a batch.');
+    assignment = parts[0]; state.assignment = assignment;
+    try { sessionStorage.setItem(ASSIGNMENT_KEY, JSON.stringify(assignment)); } catch {}
+    const urls = parts.slice(1).map(part => `${location.origin}${location.pathname}#aural=${part.start}-${part.end}`);
+    try { chrome.runtime.sendMessage({ type: 'openTabs', urls }); } catch { urls.forEach(url => window.open(url, '_blank')); }
+    note(`Batch ready. This tab owns ${assignment.start}–${assignment.end}; the other tabs have their own ranges.`);
+    render();
   }
 
-  function clearBook() {
-    // native confirm() freezes automation and blocks the tab's input queue —
-    // use a two-click arm instead: first click arms for 5s, second click wipes
-    if (!clearBook.armed) {
-      clearBook.armed = true;
-      if (ui.clearBtn) ui.clearBtn.textContent = 'Sure?';
-      log('Clear pressed — press again within 5s to delete all saved chapters.');
-      setTimeout(() => {
-        clearBook.armed = false;
-        if (ui.clearBtn) ui.clearBtn.textContent = 'Clear';
-      }, 5000);
+  // ---- strict send-once engine ---------------------------------------------
+
+  function active() { return state.items.find(item => item.id === state.activeId); }
+  function setPhase(phase) { state.phase = phase; state.phaseAt = now(); render(); }
+  function setFailure(item, message) {
+    if (item) { item.status = 'failed'; item.error = message; }
+    state.paused = true;
+    setPhase(PHASE.PAUSED);
+    persistRun();
+    note(`Paused: ${message}`);
+  }
+  function beginFresh() {
+    state.items = makeQueue();
+    state.activeId = state.items[0]?.id || null;
+    state.paused = false;
+    if (!state.activeId) return note('There are no chapters in this range.');
+    setPhase(PHASE.COOLDOWN);
+    state.phaseAt = now() - NEXT_CHAPTER_MS;
+    persistRun();
+    note(`New run ready: ${state.items.filter(item => !item.setup).length} chapters. Each chapter can be sent only once.`);
+  }
+  function resume() {
+    const item = active();
+    if (!item) return beginFresh();
+    if (item.status === 'failed') return note('If the finished panel script is visible, use Save answer + continue. Only use Retry chapter when you truly need a new generation.');
+    state.paused = false;
+    if (item.sentOnce || item.status === 'sent' || item.status === 'writing') {
+      item.status = 'sent';
+      item.sentAt ||= now();
+      captureBaseline();
+      setPhase(PHASE.SENT);
+      note(`Watching ${item.label}; it will not be sent again.`);
+    } else {
+      setPhase(PHASE.COOLDOWN);
+      state.phaseAt = now() - NEXT_CHAPTER_MS;
+    }
+    persistRun();
+  }
+  function startTyping(item) {
+    if (isGenerating()) return;
+    captureBaseline();
+    item.status = 'typing';
+    item.error = '';
+    setPhase(PHASE.TYPING);
+    if (!insertText(item.prompt)) return setFailure(item, 'ChatGPT input box was not found.');
+    item.status = 'ready';
+    setPhase(PHASE.READY);
+    persistRun();
+  }
+  function commitSend(item) {
+    const button = sendButton();
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+    // This is the only automatic click for this attempt. The flag is saved
+    // before the next engine tick, so a slow UI/reload cannot produce a second click.
+    item.sentOnce = true;
+    item.attempts = (item.attempts || 0) + 1;
+    item.status = 'sent';
+    item.sentAt = now();
+    button.click();
+    setPhase(PHASE.SENT);
+    persistRun();
+    note(`${item.label} sent once. Waiting for ChatGPT.`);
+    return true;
+  }
+  function finishItem(item) {
+    item.status = 'saved';
+    item.finishedAt = now();
+    const next = state.items.find(candidate => candidate.status === 'queued');
+    state.activeId = next?.id || null;
+    persistRun();
+    if (!next) {
+      state.paused = true;
+      setPhase(PHASE.DONE);
+      note('Run complete. Your chapters are in the Script Vault.');
       return;
     }
-    clearBook.armed = false;
-    if (ui.clearBtn) ui.clearBtn.textContent = 'Clear';
-    try {
-      chrome.storage.local.get(null, (all) => {
-        const keys = Object.keys(all).filter(k => k.startsWith(CHAP_PREFIX));
-        chrome.storage.local.remove(keys, () => {
-          log(`Cleared ${keys.length} saved chapters.`);
-          updateBookUI();
-        });
-      });
-    } catch {}
+    setPhase(PHASE.COOLDOWN);
   }
-
-  function updateBookUI() {
-    if (!ui.bookStatus) return;
-    getBook((chaps) => {
-      if (!ui.bookStatus) return;
-      if (!chaps.length) { ui.bookStatus.textContent = 'No chapters saved yet.'; return; }
-      const ns = chaps.map(c => c.n);
-      const lo = ns[0], hi = ns[ns.length - 1];
-      const missing = [];
-      const have = new Set(ns);
-      for (let i = lo; i <= hi; i++) if (!have.has(i)) missing.push(i);
-      ui.bookStatus.textContent =
-        `Saved: ${chaps.length} chapters (${lo}–${hi})` +
-        (missing.length ? ` · missing: ${missing.join(', ')}` : '');
-    });
-  }
-
-  // ---------------------------------------------------------------- multi-tab
-
-  function splitRange(s, e, k) {
-    const total = e - s + 1;
-    const k2 = Math.max(1, Math.min(k, total));
-    const base = Math.floor(total / k2);
-    let extra = total % k2;
-    const ranges = [];
-    let cur = s;
-    for (let i = 0; i < k2; i++) {
-      const len = base + (extra-- > 0 ? 1 : 0);
-      ranges.push([cur, cur + len - 1]);
-      cur += len;
-    }
-    return ranges;
-  }
-
-  function openBatchTabs() {
-    const s = Math.min(settings.rangeStart, settings.rangeEnd);
-    const e = Math.max(settings.rangeStart, settings.rangeEnd);
-    const ranges = splitRange(s, e, settings.tabCount);
-    if (ranges.length < 2) { log('Range too small to split — just press Start here.'); return; }
-
-    // this tab takes the first slice
-    state.assignment = { s: ranges[0][0], e: ranges[0][1] };
-    try { sessionStorage.setItem(ASSIGN_KEY, JSON.stringify(state.assignment)); } catch {}
-    adoptAssignment();
-    refreshRangeInputs();
-    showAssignmentBanner();
-
-    const urls = ranges.slice(1).map(r => `https://chatgpt.com/#cgqr=${r[0]}-${r[1]}`);
-    let sent = false;
-    try {
-      chrome.runtime.sendMessage({ type: 'openTabs', urls }, (res) => {
-        if (chrome.runtime.lastError || !res || !res.ok) urls.forEach(u => window.open(u, '_blank'));
-      });
-      sent = true;
-    } catch {}
-    if (!sent) urls.forEach(u => window.open(u, '_blank'));
-
-    log(`Split ${s}–${e} across ${ranges.length} tabs: ` +
-      ranges.map((r, i) => `tab ${i + 1} → ${r[0]}–${r[1]}`).join(', '));
-    log('This tab does the first slice. In each new tab: attach that tab\'s PDFs and press its Begin button.');
-  }
-
-  function beginAssignedRun(files) {
-    const a = state.assignment || {
-      s: Math.min(settings.rangeStart, settings.rangeEnd),
-      e: Math.max(settings.rangeStart, settings.rangeEnd),
-    };
-    adoptAssignment();
-    refreshRangeInputs();
-
-    // The chapters come from the FILE NAMES, not from counting files against
-    // the range — chapter_7_script_context.pdf runs as "go 7". Un-numbered
-    // PDFs (hook_script_context.pdf, ungrouped_panels…) ride along as extra
-    // context. Whatever happens, something always runs — never a dead click.
-    let chapterNums = null;
-    if (files && files.length) {
-      // files were selected through ChatGPT'S OWN picker, so ChatGPT is
-      // already uploading them (chips visible). Our only job is reading the
-      // chapter numbers out of the file names to build the queue.
-      const parsed = files.map(f => ({ f, n: chapterNumFromName(f.name) }));
-      const extras = parsed.filter(x => x.n == null).map(x => x.f);
-      let numbered = parsed.filter(x => x.n != null);
-      // batch tab: run only this tab's assigned chapters when they overlap
-      if (state.assignment && numbered.some(x => x.n >= a.s && x.n <= a.e)) {
-        numbered = numbered.filter(x => x.n >= a.s && x.n <= a.e);
-      }
-      numbered.sort((x, y) => x.n - y.n);
-      if (numbered.length) {
-        chapterNums = [...new Set(numbered.map(x => x.n))];
-        settings.rangeStart = chapterNums[0];
-        settings.rangeEnd = chapterNums[chapterNums.length - 1];
-        refreshRangeInputs();
-        log(`ChatGPT is uploading ${files.length} PDFs → queueing chapters ${chapterNums.join(', ')}` +
-          (extras.length ? ` (extra context: ${extras.map(f => f.name).join(', ')})` : '') + '.');
-      } else {
-        log(`Couldn't read chapter numbers from the file names — running the configured range ${a.s}–${a.e}.`);
-      }
-      log('The setup message will send itself as soon as the uploads finish.');
-    }
-
-    settings.sendSetupFirst = true;
-    state.queue = buildQueue(chapterNums);
-    state.queueFp = settingsFingerprint();
-    state.idx = 0;
-    if (!state.queue.length) { log('Nothing to queue.'); return; }
+  function retryCurrent() {
+    const item = active();
+    if (!item || item.status !== 'failed') return;
+    // Retrying is intentional and always visibly recorded as a new attempt.
+    item.status = 'queued'; item.sentOnce = false; item.error = '';
     state.paused = false;
-    state.sendRetries = 0;
-    setPhase(PHASE.DELAY);
-    state.phaseSince = now() - settings.delaySec * 1000;
-    persistState();
-    const chaps = state.queue.filter(q => !q.isSetup);
-    log(`Begun: setup message + ${chaps.length} chapters (${chaps[0] ? chaps[0].text : ''} → ${chaps.length ? chaps[chaps.length - 1].text : ''}).`);
-    updateUI();
+    setPhase(PHASE.COOLDOWN);
+    state.phaseAt = now() - NEXT_CHAPTER_MS;
+    persistRun();
+    note(`Manual retry armed for ${item.label} (attempt ${(item.attempts || 0) + 1}).`);
   }
-
-  // ---------------------------------------------------------------- notifications
-
-  function beep() {
-    if (!settings.beepWhenDone) return;
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const play = (freq, t0, dur) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.frequency.value = freq;
-        osc.connect(gain); gain.connect(ctx.destination);
-        gain.gain.setValueAtTime(0.15, ctx.currentTime + t0);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t0 + dur);
-        osc.start(ctx.currentTime + t0);
-        osc.stop(ctx.currentTime + t0 + dur);
-      };
-      play(880, 0, 0.25); play(1175, 0.3, 0.35);
-    } catch {}
-  }
-
-  function flashTitle(prefix) {
-    const orig = document.title.replace(/^(✅|⚠️) [^|]*\| /, '');
-    document.title = `${prefix} | ${orig}`;
-  }
-
-  // ---------------------------------------------------------------- engine
-
-  // ChatGPT sometimes stalls mid-answer (stop button gone) and resumes a few
-  // seconds later. If we harvested during the stall we stored a truncated
-  // chapter — so right before the NEXT prompt is sent, while the previous
-  // response is provably final, check whether it grew and re-save it.
-  function maybeResavePrev() {
-    const h = state.lastHarvest;
-    if (!h || h.n == null || !h.key) return;
-    // locate the chapter's own message by id — works even after newer
-    // messages were sent below it
-    const node = assistantNodes().find(n => nodeKey(n) === h.key);
-    if (!node) return;
-    const panels = extractPanels(node.innerText || '');
-    if (panels && panels.length > h.len) {
-      log(`Chapter ${h.n} kept generating after a stall — re-saved with the full text (${panels.length} vs ${h.len} chars).`);
-      saveChapter(h.n, panels);
-      h.len = panels.length;
-    }
-  }
-
-  const TICK_MS = 500;
-  const START_TIMEOUT_MS = 25000;      // normal prompt: generation must start within this
-  const SETUP_START_TIMEOUT_MS = 600000; // setup message waits for big PDF uploads
-  const MAX_SEND_RETRIES = 3;
-
-  function setPhase(p) {
-    state.phase = p;
-    state.phaseSince = now();
-    if (p === PHASE.SENDING) state.enterTried = false;
-  }
-
-  function currentItem() { return state.queue[state.idx]; }
-
-  function startRun(fresh) {
-    if (fresh) {
-      state.queue = buildQueue();
-      state.queueFp = settingsFingerprint();
-      state.idx = 0;
-      if (!state.queue.length) { log('Nothing to queue — check your template/list.'); return; }
-    }
-    if (state.idx >= state.queue.length) { log('Queue already finished. Reset to run again.'); return; }
-    const item = currentItem();
-    if (item && item.status === 'error') item.status = 'pending'; // retry after a validation failure
-    state.paused = false;
-    state.sendRetries = 0;
-    setPhase(PHASE.DELAY);
-    state.phaseSince = now() - settings.delaySec * 1000;
-    if (fresh) {
-      const chaps = state.queue.filter(q => !q.isSetup);
-      const plan = chaps.length ? ` (${chaps[0].text} → ${chaps[chaps.length - 1].text})` : '';
-      log(`Started queue: ${state.queue.length} prompts${plan}.`);
-    } else log('Resumed.');
-    persistState();
-    updateUI();
-  }
-
-  function pauseRun(msg) {
-    state.paused = true;
-    if (msg) log(msg);
-    persistState();
-    updateUI();
-  }
-
-  function resetRun() {
-    state.queue = [];
-    state.idx = 0;
-    state.paused = true;
-    setPhase(PHASE.IDLE);
-    try { sessionStorage.removeItem(STATE_KEY); } catch {}
-    log('Queue reset (saved book chapters are kept).');
-    updateUI();
-  }
-
-  function finishRun() {
-    setPhase(PHASE.FINISHED);
-    state.paused = true;
-    persistState();
-    log(`All ${state.queue.length} prompts completed. 🎉 Use "Copy full script" when every tab is done.`);
-    flashTitle('✅ Queue done');
-    beep();
-    updateUI();
-  }
-
-  function failRun(reason) {
-    const item = currentItem();
-    if (item) item.status = 'error';
-    setPhase(PHASE.ERROR);
-    state.paused = true;
-    persistState();
-    log(`⚠️ ${reason} — queue paused. Press Resume to retry this prompt, or Skip to move on.`);
-    flashTitle('⚠️ Queue paused');
-    beep();
-    updateUI();
-  }
-
-  function completeCurrentItem() {
-    maybeResavePrev();
-    const item = currentItem();
-    item.status = 'done';
-    item.elapsedMs = now() - (item.startedAt || now());
-    log(`Done ${state.idx + 1}/${state.queue.length} in ${fmtDur(item.elapsedMs)}.`);
-    state.idx++;
-    persistState();
-    if (state.idx >= state.queue.length) finishRun();
-    else { state.sendRetries = 0; setPhase(PHASE.DELAY); }
-  }
-
-  function tick() {
-    try {
-      runEngine();
-    } catch (e) {
-      // never let one bad tick take the page down
-      log(`Engine error: ${e && e.message ? e.message : e}`);
-      pauseRun('Unexpected error — queue paused.');
-    }
-    // continuous watch (even when paused or finished): if the last saved
-    // chapter's message kept growing after a stall, re-save the full text
-    if (now() - (state.lastResaveCheck || 0) > 2000) {
-      state.lastResaveCheck = now();
-      try { maybeResavePrev(); } catch {}
-    }
-    updateUI();
-  }
-
-  function runEngine() {
-    if (state.paused) return;
-
-    const item = currentItem();
+  function skipCurrent() {
+    const item = active();
     if (!item) return;
-    const inPhase = now() - state.phaseSince;
-
-    switch (state.phase) {
-      case PHASE.DELAY: {
-        if (inPhase >= settings.delaySec * 1000) {
-          if (isGenerating()) {
-            // previous response is still (or resumed) generating — wait HERE.
-            // Never enter GENERATING/STABILIZING before this item is sent:
-            // that used to harvest the previous chapter's text under this
-            // item's number.
-            if (!item.waitLogged) { item.waitLogged = true; log('Page is still generating; waiting…'); }
-            break;
-          }
-          maybeResavePrev();
-          // resumed after a pause during which the response already finished:
-          // don't re-send, just wrap up the current item
-          if (item.status === 'running' && newAssistantArrived()) {
-            setPhase(PHASE.STABILIZING);
-            break;
-          }
-          state.baselineAssistantCount = assistantCount();
-          state.baselineUserCount = userCount();
-          state.baselineAssistantKey = lastAssistantKey();
-          state.baselineUserKey = lastUserKey();
-          item.status = 'running';
-          item.startedAt = now();
-          state.promptStartedAt = now();
-          setPhase(PHASE.INSERTING);
-          insertPromptAsync(item.text, (ok) => {
-            if (state.phase !== PHASE.INSERTING) return; // reset/skip happened meanwhile
-            if (!ok) { failRun('Could not find the ChatGPT input box'); return; }
-            setPhase(PHASE.SENDING);
-            log(`Sending ${state.idx + 1}/${state.queue.length}: "${item.isSetup ? 'setup message' : item.text}"`);
-          });
-        }
-        break;
-      }
-
-      case PHASE.INSERTING: {
-        // insertPromptAsync moves us on; this is just a watchdog
-        if (inPhase > 120000) failRun('Inserting the prompt took too long');
-        break;
-      }
-
-      case PHASE.SENDING: {
-        if (isGenerating() || newAssistantArrived()) {
-          state.sendRetries = 0;
-          setPhase(PHASE.GENERATING);
-          break;
-        }
-        // the prompt already left the composer (a new user message exists in
-        // the chat) — NEVER click or re-send after this point. A slow model
-        // start (big PDFs, long thinking) used to trip the 25s retry below
-        // and send the same "go N" twice, derailing the whole queue.
-        if (promptLeftComposer()) {
-          if (now() - state.promptStartedAt > settings.timeoutMin * 60000) {
-            failRun(`Prompt exceeded the ${settings.timeoutMin} min timeout`);
-          }
-          break;
-        }
-        // keep trying to click send (button enables after text insert /
-        // uploads finish) — but at most one successful click per 1.5s so a
-        // briefly-still-enabled button can't be double-clicked
-        const clicked = (now() - state.lastClickAt > 1500) && clickSend();
-        if (clicked) state.lastClickAt = now();
-        if (!clicked && inPhase > 5000 && !state.enterTried && !item.isSetup) {
-          state.enterTried = true;
-          if (pressEnterToSend()) log('Send button not found — trying Enter key fallback.');
-        }
-        const startTimeout = item.isSetup ? SETUP_START_TIMEOUT_MS : START_TIMEOUT_MS;
-        if (inPhase > startTimeout) {
-          if (state.sendRetries < MAX_SEND_RETRIES) {
-            state.sendRetries++;
-            log(`Message never left the composer — retry ${state.sendRetries}/${MAX_SEND_RETRIES}…`);
-            setPhase(PHASE.INSERTING);
-            insertPromptAsync(item.text, (ok) => {
-              if (state.phase !== PHASE.INSERTING) return;
-              if (!ok) { failRun('Could not find the ChatGPT input box'); return; }
-              setPhase(PHASE.SENDING);
-            });
-          } else {
-            failRun('The prompt could not be sent');
-          }
-        }
-        break;
-      }
-
-      case PHASE.GENERATING: {
-        if (now() - state.promptStartedAt > settings.timeoutMin * 60000) {
-          failRun(`Prompt exceeded the ${settings.timeoutMin} min timeout`);
-          break;
-        }
-        if (!isGenerating()) setPhase(PHASE.STABILIZING);
-        break;
-      }
-
-      case PHASE.STABILIZING: {
-        if (isGenerating()) { setPhase(PHASE.GENERATING); break; } // it resumed (tool use, multi-step)
-        // the response text must also STOP GROWING for the settle window —
-        // the stop button alone disappears during mid-answer stalls, which
-        // used to harvest half-written chapters
-        const curLen = lastAssistantText().length;
-        if (curLen !== state.stabLen) { state.stabLen = curLen; state.stabLenAt = now(); }
-        if (inPhase >= settings.stableSec * 1000 &&
-            now() - state.stabLenAt >= settings.stableSec * 1000) {
-          // no response yet — the model hasn't actually answered (it may
-          // still be thinking without visible streaming). Don't complete on a
-          // stale previous response; keep waiting up to the Max min timeout.
-          if (!newAssistantArrived()) {
-            if (now() - state.promptStartedAt > settings.timeoutMin * 60000) {
-              failRun(`Prompt exceeded the ${settings.timeoutMin} min timeout`);
-            }
-            break;
-          }
-          if (!item.isSetup && settings.harvest) {
-            const full = lastAssistantText();
-            const panels = extractPanels(full);
-            if (!panels) {
-              // A "finished" response with no panels is usually a model that
-              // is STILL WORKING (thinking phase shows a quiet message before
-              // the script streams in). Watch it for a long grace window —
-              // re-sending too early is how "go 1" went out twice.
-              const graceMs = Math.max(20, settings.stableSec * 10) * 1000;
-              if (!item.noPanelsSince) {
-                item.noPanelsSince = now();
-                log(`Chapter ${item.n}: response has no [Panel ...] lines yet — watching it for ${Math.round(graceMs / 1000)}s before doing anything (the model may still be thinking).`);
-              }
-              if (now() - item.noPanelsSince < graceMs) break; // keep watching
-              item.noPanelsSince = 0;
-              // don't stop the world: retry this chapter once automatically,
-              // then skip it and keep the queue moving (it shows up in the
-              // book status as missing — re-run just that number later)
-              item.harvestRetries = (item.harvestRetries || 0) + 1;
-              if (item.harvestRetries <= 1) {
-                log(`⚠️ Chapter ${item.n}: still no [Panel ...] lines after the grace window — re-sending this chapter once.`);
-                item.status = 'pending';
-                state.sendRetries = 0;
-                setPhase(PHASE.DELAY);
-                break;
-              }
-              log(`⚠️ Chapter ${item.n}: still no [Panel ...] lines after a retry — skipped. Re-run "go ${item.n}" later; continuing with the next chapter.`);
-              beep();
-              item.status = 'error';
-              state.idx++;
-              persistState();
-              if (state.idx >= state.queue.length) finishRun();
-              else { state.sendRetries = 0; setPhase(PHASE.DELAY); }
-              break;
-            }
-            item.noPanelsSince = 0;
-            validateChapter(item, full, panels);
-            saveChapter(item.n, panels);
-            state.lastHarvest = { n: item.n, len: panels.length, key: lastAssistantKey() };
-          }
-          completeCurrentItem();
-        }
-        break;
-      }
-
-      default:
-        break;
+    item.status = 'skipped'; item.finishedAt = now();
+    const next = state.items.find(candidate => candidate.status === 'queued');
+    state.activeId = next?.id || null;
+    persistRun();
+    if (next) { state.paused = false; setPhase(PHASE.COOLDOWN); }
+    else { state.paused = true; setPhase(PHASE.DONE); }
+    note(`${item.label} skipped.`);
+  }
+  function extractPanels(text) {
+    const match = text.match(/\[Panel\s*\d+\]/i);
+    return match ? text.slice(match.index).trim() : '';
+  }
+  function latestPanelResponse(item) {
+    // ChatGPT occasionally adds an empty assistant wrapper after its actual
+    // answer. Always scan backwards for the latest message containing a panel
+    // instead of trusting only the final wrapper.
+    const expectedPrompt = clean(item?.prompt);
+    const promptNode = expectedPrompt
+      ? users().slice().reverse().find(node => clean(node.innerText).includes(expectedPrompt))
+      : null;
+    for (const node of assistants().slice().reverse()) {
+      const text = node.innerText || node.textContent || '';
+      const followsThisPrompt = !promptNode ||
+        !!(promptNode.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING);
+      if (followsThisPrompt && extractPanels(text)) return { node, text };
     }
+    return null;
   }
-
-  setInterval(tick, TICK_MS);
-
-  // ---------------------------------------------------------------- UI
-
-  let ui = {};
-  const logLines = [];
-  const UI_PREFS_KEY = 'cgqrUiPrefs';
-
-  function log(msg) {
-    const t = new Date().toLocaleTimeString();
-    logLines.push(`[${t}] ${msg}`);
-    if (logLines.length > 300) logLines.shift();
-    if (ui.log) {
-      ui.log.textContent = logLines.join('\n');
-      ui.log.scrollTop = ui.log.scrollHeight;
-    }
+  function saveVisibleAnswerAndContinue() {
+    const item = active();
+    if (!item || item.setup) return;
+    const answer = latestPanelResponse(item);
+    const panels = answer && extractPanels(answer.text);
+    if (!panels) return note('I cannot find a visible [Panel] script to save yet. Do not retry unless you truly want another generation.');
+    item.status = 'saving';
+    item.error = '';
+    state.paused = false;
+    saveChapter(item.number, panels);
+    finishItem(item);
+    note(`${item.label} saved from the visible answer. Continuing without a retry.`);
   }
-
-  function el(tag, attrs = {}, ...children) {
-    const node = document.createElement(tag);
-    for (const [k, v] of Object.entries(attrs)) {
-      if (k === 'class') node.className = v;
-      else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
-      else if (k === 'text') node.textContent = v;
-      else node.setAttribute(k, v);
-    }
-    children.forEach(c => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
-    return node;
-  }
-
-  function makeSwitch(checked, labelText, title) {
-    const input = el('input', { type: 'checkbox' });
-    input.checked = checked;
-    const row = el('label', { class: 'cgqr-switch-row', title: title || '' },
-      el('span', { class: 'cgqr-switch-label', text: labelText }),
-      el('span', { class: 'cgqr-switch' }, input, el('span', { class: 'cgqr-switch-track' })));
-    return { row, input };
-  }
-
-  function loadUiPrefs() {
-    try { return JSON.parse(localStorage.getItem(UI_PREFS_KEY)) || {}; } catch { return {}; }
-  }
-  function saveUiPrefs(prefs) {
-    try { localStorage.setItem(UI_PREFS_KEY, JSON.stringify(prefs)); } catch {}
-  }
-
-  function refreshRangeInputs() {
-    if (ui.fromInput) ui.fromInput.value = settings.rangeStart;
-    if (ui.toInput) ui.toInput.value = settings.rangeEnd;
-  }
-
-  function showAssignmentBanner() {
-    if (!ui.banner || !state.assignment) return;
-    ui.bannerText.textContent = `This tab: chapters ${state.assignment.s}–${state.assignment.e}`;
-  }
-
-  function makeDraggable(panel, handle) {
-    let startX = 0, startY = 0, startLeft = 0, startTop = 0, dragging = false;
-    handle.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('button')) return;
-      dragging = true;
-      const rect = panel.getBoundingClientRect();
-      startX = e.clientX; startY = e.clientY;
-      startLeft = rect.left; startTop = rect.top;
-      handle.setPointerCapture(e.pointerId);
-    });
-    handle.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
-      const left = Math.max(0, Math.min(window.innerWidth - 80, startLeft + e.clientX - startX));
-      const top = Math.max(0, Math.min(window.innerHeight - 40, startTop + e.clientY - startY));
-      panel.style.left = left + 'px';
-      panel.style.top = top + 'px';
-      panel.style.right = 'auto';
-    });
-    handle.addEventListener('pointerup', () => {
-      if (!dragging) return;
-      dragging = false;
-      const prefs = loadUiPrefs();
-      prefs.left = panel.style.left;
-      prefs.top = panel.style.top;
-      saveUiPrefs(prefs);
-    });
-  }
-
-  function buildPanel() {
-    const prefs = loadUiPrefs();
-    const panel = el('div', { id: 'cgqr-panel' });
-    if (prefs.left && prefs.top) {
-      panel.style.left = prefs.left;
-      panel.style.top = prefs.top;
-      panel.style.right = 'auto';
-    }
-
-    // ---- header / brand
-    ui.statusDot = el('span', { class: 'cgqr-dot cgqr-dot-idle' });
-    const collapseBtn = el('button', { class: 'cgqr-icon-btn', title: 'Collapse' },
-      el('span', { class: 'cgqr-chevron' }));
-    const header = el('div', { class: 'cgqr-header' },
-      el('div', { class: 'cgqr-brand' },
-        el('div', { class: 'cgqr-logo', text: 'A' }),
-        el('div', { class: 'cgqr-brand-text' },
-          el('div', { class: 'cgqr-brand-name', text: 'AURAL' }),
-          el('div', { class: 'cgqr-brand-sub', text: 'GPT Script Runner' }))),
-      el('div', { class: 'cgqr-header-actions' }, ui.statusDot, collapseBtn));
-    panel.appendChild(header);
-
-    const body = el('div', { class: 'cgqr-body' });
-    panel.appendChild(body);
-
-    const setCollapsed = (collapsed) => {
-      body.classList.toggle('cgqr-hidden', collapsed);
-      panel.classList.toggle('cgqr-collapsed', collapsed);
-      const p = loadUiPrefs(); p.collapsed = collapsed; saveUiPrefs(p);
-    };
-    collapseBtn.addEventListener('click', () => setCollapsed(!body.classList.contains('cgqr-hidden')));
-    if (prefs.collapsed) setCollapsed(true);
-
-    makeDraggable(panel, header);
-
-    // ---- assignment banner (batch tabs)
-    ui.bannerText = el('span', { class: 'cgqr-banner-text', text: '' });
-    const beginBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary', text: 'Attach PDFs + Begin' });
-    let gptPickerArmed = false;
-    beginBtn.addEventListener('click', () => {
-      // chatgpt.com ignores files injected by scripts (untrusted events), so
-      // we open ChatGPT'S OWN picker instead: the user's selection reaches
-      // ChatGPT as a real user action (chips + uploads guaranteed), and we
-      // read the chosen file names to build the chapter queue.
-      const gptInput = getChatGPTFileInput();
-      if (!gptInput) {
-        log('⚠️ Couldn\'t find ChatGPT\'s upload input — add the PDFs via ChatGPT\'s + menu, then press "Begin (PDFs uploaded)".');
+  function tick() {
+    if (state.paused) return;
+    const item = active();
+    if (!item) return;
+    const elapsed = now() - state.phaseAt;
+    try {
+      if (state.phase === PHASE.COOLDOWN) {
+        if (elapsed >= NEXT_CHAPTER_MS) startTyping(item);
         return;
       }
-      if (!gptPickerArmed) {
-        gptPickerArmed = true;
-        gptInput.addEventListener('change', () => {
-          const files = Array.from(gptInput.files || []);
-          if (files.length) beginAssignedRun(files);
-        }, { once: true });
+      if (state.phase === PHASE.READY) {
+        if (commitSend(item)) return;
+        return;
       }
-      log('ChatGPT\'s file picker opened — select this tab\'s chapter PDFs.');
-      gptInput.click();
+      if (state.phase === PHASE.SENT) {
+        if (isGenerating() || promptLeftComposer() || responseVisible(item)) { setPhase(PHASE.WRITING); return; }
+        return;
+      }
+      if (state.phase === PHASE.WRITING) {
+        if (!isGenerating()) { state.stableLength = -1; state.stableAt = now(); setPhase(PHASE.SETTLING); }
+        return;
+      }
+      if (state.phase === PHASE.SETTLING) {
+        if (isGenerating()) return setPhase(PHASE.WRITING);
+        const panelAnswer = latestPanelResponse(item);
+        const text = panelAnswer?.text || lastAssistant()?.innerText || '';
+        if (text.length !== state.stableLength) { state.stableLength = text.length; state.stableAt = now(); }
+        if ((!responseVisible(item) && !panelAnswer) || now() - state.stableAt < AUTO_QUIET_MS) return;
+        if (item.setup || !settings.harvest) return finishItem(item);
+        const panels = panelAnswer ? extractPanels(panelAnswer.text) : extractPanels(text);
+        if (!panels) {
+          return setFailure(item, 'ChatGPT finished but the answer has no [Panel] lines. It was not re-sent.');
+        }
+        saveChapter(item.number, panels);
+        finishItem(item);
+      }
+    } catch (error) { setFailure(item, error?.message || 'Unexpected runner error.'); }
+  }
+  setInterval(() => { tick(); render(); }, 500);
+
+  // ---- book actions ---------------------------------------------------------
+
+  function updateBook() {
+    getBook(chapters => {
+      if (!ui.bookStatus) return;
+      const expected = rangeForThisTab();
+      const saved = new Set(chapters.map(chapter => chapter.number));
+      let inRange = 0;
+      for (let number = expected.start; number <= expected.end; number++) if (saved.has(number)) inRange++;
+      ui.bookStatus.textContent = chapters.length
+        ? `${chapters.length} saved total · ${inRange}/${expected.end - expected.start + 1} in this run`
+        : 'No saved chapters yet';
     });
-    const beginNoPdfBtn = el('button', { class: 'cgqr-btn', text: 'Begin (PDFs uploaded)' });
-    beginNoPdfBtn.addEventListener('click', () => beginAssignedRun(null));
-    ui.bannerText.textContent = 'Whole book in this tab';
-    ui.banner = el('div', { class: 'cgqr-banner' },
-      ui.bannerText,
-      el('div', { class: 'cgqr-controls' }, beginBtn, beginNoPdfBtn));
-    body.appendChild(ui.banner);
-
-    // ---- book setup (collapsible card)
-    const masterArea = el('textarea', { class: 'cgqr-textarea', rows: '4', placeholder: 'Your big master prompt…' });
-    masterArea.value = settings.masterPrompt;
-    const linkInput = el('input', { class: 'cgqr-input', placeholder: 'https://mangafire.to/… (book link)' });
-    linkInput.value = settings.bookLink;
-    const sampleArea = el('textarea', { class: 'cgqr-textarea', rows: '3', placeholder: 'STYLE SAMPLE — paste example script lines…' });
-    sampleArea.value = settings.styleSample;
-    const sendSetupBtn = el('button', { class: 'cgqr-btn', text: 'Send setup now' });
-    sendSetupBtn.addEventListener('click', () => {
-      const setup = composeSetup();
-      if (!setup) { log('Book setup fields are empty.'); return; }
-      log('Inserting setup message…');
-      insertPromptAsync(setup, (ok) => {
-        if (!ok) { log('Could not find the ChatGPT input box.'); return; }
-        setTimeout(() => { if (!clickSend()) log('Setup text inserted — press ChatGPT\'s send button when uploads finish.'); }, 600);
-        log('Setup message sent (or waiting on uploads).');
-      });
+  }
+  function copyBook() {
+    getBook(chapters => {
+      if (!chapters.length) return note('Nothing has been saved yet.');
+      const text = chapters.map(chapter => chapter.text.trim()).join('\n\n') + '\n';
+      navigator.clipboard?.writeText(text).then(() => note('Full script copied.'), () => note('Copy failed; use Download.'));
     });
-    const setupDetails = el('details', { class: 'cgqr-details' },
-      el('summary', { class: 'cgqr-summary', text: 'Book setup' }),
-      el('div', { class: 'cgqr-card-body' },
-        el('label', { class: 'cgqr-label', text: 'Master prompt' }), masterArea,
-        el('label', { class: 'cgqr-label', text: 'Book link' }), linkInput,
-        el('label', { class: 'cgqr-label', text: 'Style sample' }), sampleArea,
-        sendSetupBtn));
-    body.appendChild(el('div', { class: 'cgqr-card' }, setupDetails));
-
-    // ---- queue card: mode toggle + range + timing
-    const modeTemplate = el('button', { class: 'cgqr-tab', text: 'Template' });
-    const modeList = el('button', { class: 'cgqr-tab', text: 'Custom list' });
-
-    const tplInput = el('input', { class: 'cgqr-input', value: settings.template, title: '{n} is replaced with the number' });
-    ui.fromInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', value: settings.rangeStart });
-    ui.toInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', value: settings.rangeEnd });
-    const tplSection = el('div', { class: 'cgqr-section' },
-      el('label', { class: 'cgqr-label', text: 'Prompt template · {n} = chapter' }),
-      tplInput,
-      el('div', { class: 'cgqr-row' },
-        el('label', { class: 'cgqr-label-inline', text: 'From' }), ui.fromInput,
-        el('label', { class: 'cgqr-label-inline', text: 'to' }), ui.toInput));
-
-    const listArea = el('textarea', { class: 'cgqr-textarea', rows: '5', placeholder: 'One prompt per line…' });
-    listArea.value = settings.list;
-    const listSection = el('div', { class: 'cgqr-section cgqr-hidden' },
-      el('label', { class: 'cgqr-label', text: 'Prompts (one per line)' }), listArea);
-
-    const delayInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '0', value: settings.delaySec });
-    const stableInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '2', value: settings.stableSec });
-    const timeoutInput = el('input', { class: 'cgqr-input cgqr-num', type: 'number', min: '1', value: settings.timeoutMin });
-    const timingRow = el('div', { class: 'cgqr-row cgqr-row-3' },
-      el('div', { class: 'cgqr-field' },
-        el('label', { class: 'cgqr-label', text: 'Delay s', title: 'Wait after a response finishes before sending the next prompt' }), delayInput),
-      el('div', { class: 'cgqr-field' },
-        el('label', { class: 'cgqr-label', text: 'Settle s', title: 'How long generation must stay stopped to count as finished' }), stableInput),
-      el('div', { class: 'cgqr-field' },
-        el('label', { class: 'cgqr-label', text: 'Max min', title: 'Pause the queue if one prompt takes longer than this' }), timeoutInput));
-
-    body.appendChild(el('div', { class: 'cgqr-card' },
-      el('div', { class: 'cgqr-tabs' }, modeTemplate, modeList),
-      tplSection, listSection, timingRow));
-
-    function applyMode() {
-      const isTpl = settings.mode === 'template';
-      modeTemplate.classList.toggle('cgqr-tab-active', isTpl);
-      modeList.classList.toggle('cgqr-tab-active', !isTpl);
-      tplSection.classList.toggle('cgqr-hidden', !isTpl);
-      listSection.classList.toggle('cgqr-hidden', isTpl);
+  }
+  function downloadBook() {
+    getBook(chapters => {
+      if (!chapters.length) return note('Nothing has been saved yet.');
+      const url = URL.createObjectURL(new Blob([chapters.map(chapter => chapter.text.trim()).join('\n\n') + '\n'], { type: 'text/plain' }));
+      const link = document.createElement('a'); link.href = url; link.download = 'aural-script.txt'; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    });
+  }
+  function clearBook() {
+    if (!clearBook.armed) {
+      clearBook.armed = true; ui.clear.textContent = 'Click again to erase';
+      setTimeout(() => { clearBook.armed = false; if (ui.clear) ui.clear.textContent = 'Clear vault'; }, 3500);
+      return;
     }
-    modeTemplate.addEventListener('click', () => { settings.mode = 'template'; saveSettings(); applyMode(); });
-    modeList.addEventListener('click', () => { settings.mode = 'list'; saveSettings(); applyMode(); });
-
-    // ---- options card: switches + parallel tabs
-    const harvestSw = makeSwitch(settings.harvest, 'Harvest [Panel] script into book');
-    const setupSw = makeSwitch(settings.sendSetupFirst, 'Send Book setup first on Start');
-    const beepSw = makeSwitch(settings.beepWhenDone, 'Beep on finish / error');
-
-    const tabSelect = el('select', { class: 'cgqr-input cgqr-select' });
-    [2, 3, 4].forEach(k => tabSelect.appendChild(el('option', { value: String(k), text: `${k} tabs` })));
-    tabSelect.value = String(settings.tabCount);
-    tabSelect.addEventListener('change', () => { settings.tabCount = parseInt(tabSelect.value, 10) || 3; saveSettings(); });
-    const batchBtn = el('button', { class: 'cgqr-btn', text: 'Open batch tabs' });
-    batchBtn.addEventListener('click', openBatchTabs);
-
-    body.appendChild(el('div', { class: 'cgqr-card' },
-      harvestSw.row, setupSw.row, beepSw.row,
-      el('div', { class: 'cgqr-row cgqr-row-parallel' },
-        el('label', { class: 'cgqr-label-inline', text: 'Parallel', title: 'Split the chapter range across this many tabs' }),
-        tabSelect, batchBtn)));
-
-    const bind = (input, key, parse) => input.addEventListener('change', () => {
-      settings[key] = parse(input);
-      saveSettings();
+    chrome.storage.local.get(null, all => {
+      chrome.storage.local.remove(Object.keys(all).filter(key => key.startsWith(CHAPTER_KEY) || key.startsWith(LEGACY_CHAPTER_KEY)), () => { clearBook.armed = false; ui.clear.textContent = 'Clear vault'; updateBook(); note('Script Vault cleared.'); });
     });
-    bind(tplInput, 'template', i => i.value);
-    bind(ui.fromInput, 'rangeStart', i => parseInt(i.value, 10) || 1);
-    bind(ui.toInput, 'rangeEnd', i => parseInt(i.value, 10) || 1);
-    bind(listArea, 'list', i => i.value);
-    bind(delayInput, 'delaySec', i => Math.max(0, parseFloat(i.value) || 0));
-    bind(stableInput, 'stableSec', i => Math.max(2, parseFloat(i.value) || 6));
-    bind(timeoutInput, 'timeoutMin', i => Math.max(1, parseFloat(i.value) || 25));
-    bind(harvestSw.input, 'harvest', i => i.checked);
-    bind(setupSw.input, 'sendSetupFirst', i => i.checked);
-    bind(beepSw.input, 'beepWhenDone', i => i.checked);
-    bind(masterArea, 'masterPrompt', i => i.value);
-    bind(linkInput, 'bookLink', i => i.value);
-    bind(sampleArea, 'styleSample', i => i.value);
-
-    // ---- controls
-    const startBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary cgqr-btn-start', text: 'Start' });
-    const pauseBtn = el('button', { class: 'cgqr-btn', text: 'Pause' });
-    const skipBtn = el('button', { class: 'cgqr-btn', text: 'Skip', title: 'Mark current prompt done and move on' });
-    const resetBtn = el('button', { class: 'cgqr-btn cgqr-btn-danger', text: 'Reset' });
-    body.appendChild(el('div', { class: 'cgqr-controls cgqr-controls-main' }, startBtn, pauseBtn, skipBtn, resetBtn));
-
-    startBtn.addEventListener('click', () => {
-      const resumable = state.queue.length && state.idx < state.queue.length &&
-          state.phase !== PHASE.FINISHED;
-      // if the range/template changed since this queue was built, resuming
-      // would send stale prompts (e.g. an old "go 2" after "go 10") —
-      // rebuild from what's on screen instead
-      if (resumable && state.queueFp === settingsFingerprint()) {
-        startRun(false);
-      } else {
-        if (resumable) log('Range/template changed — starting a fresh queue from the current settings.');
-        startRun(true);
-      }
-    });
-    pauseBtn.addEventListener('click', () => pauseRun('Paused. Current response (if any) keeps generating; no new prompts will be sent.'));
-    skipBtn.addEventListener('click', () => {
-      const item = currentItem();
-      if (!item) return;
-      item.status = 'done';
-      state.idx++;
-      persistState();
-      log(`Skipped "${item.isSetup ? 'setup message' : item.text}".`);
-      if (state.idx >= state.queue.length && state.queue.length) finishRun();
-      else setPhase(PHASE.DELAY);
-    });
-    resetBtn.addEventListener('click', resetRun);
-
-    // ---- status + progress
-    ui.status = el('div', { class: 'cgqr-status', text: 'Idle' });
-    ui.progressBar = el('div', { class: 'cgqr-progress-fill' });
-    body.appendChild(ui.status);
-    body.appendChild(el('div', { class: 'cgqr-progress' }, ui.progressBar));
-
-    // ---- book / script output
-    ui.bookStatus = el('div', { class: 'cgqr-book-status', text: '…' });
-    ui.copyBtn = el('button', { class: 'cgqr-btn cgqr-btn-primary', text: 'Copy full script' });
-    ui.copyBtn.addEventListener('click', copyBook);
-    const dlBtn = el('button', { class: 'cgqr-btn', text: 'Download' });
-    dlBtn.addEventListener('click', downloadBook);
-    const clearBtn = el('button', { class: 'cgqr-btn cgqr-btn-danger', text: 'Clear' });
-    ui.clearBtn = clearBtn;
-    clearBtn.addEventListener('click', clearBook);
-    body.appendChild(el('div', { class: 'cgqr-card cgqr-book' },
-      el('label', { class: 'cgqr-label', text: 'Book script' }),
-      ui.bookStatus,
-      el('div', { class: 'cgqr-controls' }, ui.copyBtn, dlBtn, clearBtn)));
-
-    // ---- log
-    ui.log = el('pre', { class: 'cgqr-log' });
-    body.appendChild(ui.log);
-
-    ui.startBtn = startBtn;
-    applyMode();
-    document.documentElement.appendChild(panel);
   }
 
-  let lastStatusText = '';
-  function updateUI() {
-    if (!ui.status) return;
-    const total = state.queue.length;
-    const done = state.queue.filter(q => q.status === 'done').length;
-    let text;
-    let dotClass = 'cgqr-dot-idle';
-    if (!total) {
-      text = 'Idle — configure and press Start';
-      ui.startBtn.textContent = 'Start';
-    } else if (state.phase === PHASE.FINISHED) {
-      text = `✅ Finished ${done}/${total}`;
-      ui.startBtn.textContent = 'Start';
-      dotClass = 'cgqr-dot-done';
-    } else if (state.paused) {
-      text = `⏸ Paused at ${done}/${total}`;
-      ui.startBtn.textContent = 'Resume';
-      dotClass = state.phase === PHASE.ERROR ? 'cgqr-dot-error' : 'cgqr-dot-paused';
-    } else {
-      const item = currentItem();
-      const phaseLabel = {
-        [PHASE.DELAY]: 'waiting to send',
-        [PHASE.INSERTING]: 'inserting prompt',
-        [PHASE.SENDING]: 'sending',
-        [PHASE.GENERATING]: 'generating',
-        [PHASE.STABILIZING]: 'finishing up',
-      }[state.phase] || state.phase;
-      const label = item ? (item.isSetup ? 'setup message' : `"${item.text}"`) : '';
-      const elapsed = item && item.startedAt ? ` · ${fmtDur(now() - item.startedAt)}` : '';
-      text = `${done}/${total} done — ${phaseLabel}${label ? `: ${label}` : ''}${elapsed}`;
-      ui.startBtn.textContent = 'Running…';
-      dotClass = 'cgqr-dot-live';
-    }
-    if (text !== lastStatusText) {
-      lastStatusText = text;
-      ui.status.textContent = text;
-    }
-    if (ui.statusDot && !ui.statusDot.classList.contains(dotClass)) {
-      ui.statusDot.className = `cgqr-dot ${dotClass}`;
-    }
-    ui.progressBar.style.width = total ? `${(done / total) * 100}%` : '0%';
-  }
+  // ---- UI -------------------------------------------------------------------
 
-  // ---------------------------------------------------------------- boot
+  function element(tag, attrs = {}, ...children) {
+    const node = document.createElement(tag);
+    Object.entries(attrs).forEach(([key, value]) => {
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;
+      else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value);
+    });
+    children.flat().filter(Boolean).forEach(child => node.append(typeof child === 'string' ? document.createTextNode(child) : child));
+    return node;
+  }
+  function field(label, input) { return element('label', { class: 'ad-field' }, element('span', { text: label }), input); }
+  function settingInput(type, value, attrs = {}) { return element('input', { class: 'ad-input', type, value: String(value), ...attrs }); }
+  function bind(input, key, transform = value => value) {
+    input.addEventListener('change', () => { settings[key] = transform(input.value); saveSettings(); updateBook(); });
+  }
+  function note(message) { if (ui.note) { ui.note.textContent = message; ui.note.classList.add('ad-note-show'); } }
+  function buildUI() {
+    const panel = element('aside', { id: 'aural-desk' });
+    const collapse = element('button', { class: 'ad-icon', title: 'Collapse desk', text: '−' });
+    const header = element('header', { class: 'ad-header' },
+      element('div', { class: 'ad-mark', text: 'A' }),
+      element('div', {}, element('div', { class: 'ad-eyebrow', text: 'Aural Studio' }), element('div', { class: 'ad-title', text: 'CHAPTER DESK' })),
+      element('div', { class: 'ad-header-right' }, ui.dot = element('i', { class: 'ad-dot' }), collapse));
+    const body = element('main', { class: 'ad-body' });
+    collapse.addEventListener('click', () => { panel.classList.toggle('ad-collapsed'); collapse.textContent = panel.classList.contains('ad-collapsed') ? '+' : '−'; });
+    panel.append(header, body); document.documentElement.append(panel);
+
+    ui.assignment = element('div', { class: 'ad-assignment' }); body.append(ui.assignment);
+    // Always-visible fields: this is where the book context belongs.
+    const masterPrompt = element('textarea', { class: 'ad-input ad-textarea ad-master', placeholder: 'Paste your full master prompt here…' }); masterPrompt.value = settings.masterPrompt;
+    const bookLinks = settings.bookLinks.map((link, index) => {
+      const input = settingInput('url', link, { placeholder: index === 0 ? 'Paste primary book link here (https://…)' : `Optional book link ${index + 1} (https://…)` });
+      input.addEventListener('change', () => { settings.bookLinks[index] = input.value.trim(); saveSettings(); });
+      return input;
+    });
+    const styleSample = element('textarea', { class: 'ad-input ad-textarea ad-style', placeholder: 'Paste your example / style sample here…' }); styleSample.value = settings.styleSample;
+    const setupOn = element('input', { type: 'checkbox' }); setupOn.checked = settings.sendSetup;
+    bind(masterPrompt, 'masterPrompt'); bind(styleSample, 'styleSample');
+    setupOn.addEventListener('change', () => { settings.sendSetup = setupOn.checked; saveSettings(); });
+    body.append(element('section', { class: 'ad-card ad-book-setup' },
+      element('div', { class: 'ad-card-row' }, element('div', { class: 'ad-card-title', text: 'Book setup' }), element('span', { class: 'ad-safe', text: 'SAVES AUTOMATICALLY' })),
+      element('p', { class: 'ad-help', text: 'Paste your prompt and 1–5 book links here. ChatGPT receives every link and can use any one that works.' }),
+      element('label', { class: 'ad-check' }, setupOn, ' Send Book Setup before chapter 1'),
+      field('Master prompt', masterPrompt),
+      field('Book links · fill 1–5 as needed', element('div', { class: 'ad-link-stack' }, bookLinks)),
+      field('Style sample (optional)', styleSample)));
+    ui.heroNumber = element('div', { class: 'ad-hero-number', text: '—' });
+    ui.heroState = element('div', { class: 'ad-hero-state', text: 'Ready when you are' });
+    ui.progress = element('div', { class: 'ad-progress-bar' });
+    body.append(element('section', { class: 'ad-hero' }, element('div', { class: 'ad-hero-copy' }, element('span', { class: 'ad-kicker', text: 'Current mission' }), ui.heroNumber, ui.heroState), element('div', { class: 'ad-progress' }, ui.progress)));
+
+    body.append(element('section', { class: 'ad-card ad-pdf-drop' },
+      element('div', { class: 'ad-card-row' }, element('div', { class: 'ad-card-title', text: 'Chapter PDFs' }), element('span', { class: 'ad-safe', text: 'CHATGPT UPLOAD' })),
+      element('p', { class: 'ad-help', text: 'Select all PDFs for this tab. Chapter numbers are read from their filenames, so a batch tab automatically keeps only its own chapters.' }),
+      element('div', { class: 'ad-actions' },
+        element('button', { class: 'ad-button ad-primary', text: 'Attach PDFs + Begin', onclick: attachPdfsAndBegin }),
+        element('button', { class: 'ad-button ad-quiet', text: 'Begin (PDFs attached)', onclick: beginWithAlreadyAttachedPdfs }))));
+
+    const template = settingInput('text', settings.template, { placeholder: 'go {n}' }); bind(template, 'template');
+    const from = settingInput('number', settings.start, { min: '1' }); bind(from, 'start', value => Math.max(1, +value || 1));
+    const to = settingInput('number', settings.end, { min: '1' }); bind(to, 'end', value => Math.max(1, +value || 1));
+    const launch = element('button', { class: 'ad-button ad-primary', text: 'Start new run', onclick: beginFresh });
+    ui.resume = element('button', { class: 'ad-button ad-secondary', text: 'Resume', onclick: resume });
+    body.append(element('section', { class: 'ad-card' }, element('div', { class: 'ad-card-row' }, element('div', { class: 'ad-card-title', text: 'Queue builder' }), element('span', { class: 'ad-safe', text: 'AUTO-DETECT ANSWER' })), element('p', { class: 'ad-help', text: 'No delay, settle, or timeout settings. The next go prompt sends automatically after ChatGPT finishes and the answer stops changing.' }), field('Prompt template', template), element('div', { class: 'ad-grid' }, field('From', from), field('To', to)), element('div', { class: 'ad-actions' }, launch, ui.resume)));
+
+    ui.retry = element('button', { class: 'ad-button ad-warning', text: 'Retry chapter', onclick: retryCurrent });
+    ui.useVisible = element('button', { class: 'ad-button ad-primary', text: 'Save answer + continue', onclick: saveVisibleAnswerAndContinue });
+    ui.skip = element('button', { class: 'ad-button ad-quiet', text: 'Skip', onclick: skipCurrent });
+    ui.queue = element('div', { class: 'ad-queue' });
+    body.append(element('section', { class: 'ad-card' }, element('div', { class: 'ad-card-row' }, element('div', { class: 'ad-card-title', text: 'Run monitor' }), element('span', { class: 'ad-safe', text: 'SEND ONCE' })), element('p', { class: 'ad-help', text: 'If a visible panel script was finished but detection missed it, save that answer and continue—do not spend credits on Retry.' }), element('div', { class: 'ad-actions' }, ui.useVisible, ui.retry, ui.skip), ui.queue));
+
+    const tabs = element('select', { class: 'ad-input' }); Array.from({ length: 12 }, (_, index) => index + 1).forEach(number => tabs.append(element('option', { value: number, text: `${number} ${number === 1 ? 'tab' : 'tabs'}` }))); tabs.value = settings.tabCount;
+    tabs.addEventListener('change', () => { settings.tabCount = +tabs.value; saveSettings(); });
+    body.append(element('section', { class: 'ad-card ad-batch' }, element('div', { class: 'ad-card-row' }, element('div', { class: 'ad-card-title', text: 'Folder batch automation' }), element('span', { class: 'ad-safe', text: 'ONE FOLDER' })), element('p', { class: 'ad-help', text: 'Choose one PDF folder, choose how many tabs, and each tab receives only the PDFs for its chapter range.' }), element('div', { class: 'ad-actions' }, tabs, element('button', { class: 'ad-button ad-primary', text: 'Choose folder + auto-batch', onclick: chooseFolderAndOpenBatches }), element('button', { class: 'ad-button ad-quiet', text: 'Manual batch tabs', onclick: openBatchTabs }))));
+
+    const harvest = element('input', { type: 'checkbox' }); harvest.checked = settings.harvest;
+    harvest.addEventListener('change', () => { settings.harvest = harvest.checked; saveSettings(); });
+    body.append(element('details', { class: 'ad-card ad-advanced' }, element('summary', { text: 'Automation options' }), element('div', { class: 'ad-details' }, element('label', { class: 'ad-check' }, harvest, ' Save [Panel] output into Script Vault'))));
+
+    ui.bookStatus = element('div', { class: 'ad-book-status' });
+    ui.clear = element('button', { class: 'ad-link ad-danger', text: 'Clear vault', onclick: clearBook });
+    body.append(element('section', { class: 'ad-card ad-vault' }, element('div', { class: 'ad-card-row' }, element('div', { class: 'ad-card-title', text: 'Script Vault' }), ui.clear), ui.bookStatus, element('div', { class: 'ad-actions' }, element('button', { class: 'ad-button ad-primary', text: 'Copy full script', onclick: copyBook }), element('button', { class: 'ad-button ad-quiet', text: 'Download', onclick: downloadBook }))));
+    ui.note = element('div', { class: 'ad-note', text: 'Upload PDFs through ChatGPT’s attachment button, then start your run.' }); body.append(ui.note);
+  }
+  function render() {
+    if (!ui.heroNumber) return;
+    const item = active();
+    const total = state.items.filter(entry => !entry.setup).length;
+    const complete = state.items.filter(entry => entry.status === 'saved' || entry.status === 'skipped').length - state.items.filter(entry => entry.setup && (entry.status === 'saved' || entry.status === 'skipped')).length;
+    const phaseNames = { idle: 'Ready when you are', cooldown: 'Preparing next chapter', typing: 'Writing prompt', ready: 'Waiting for Send button', sent: 'Sent once · waiting for ChatGPT', writing: 'ChatGPT is writing', settling: 'Checking final response', paused: 'Paused safely', done: 'Run complete' };
+    ui.heroNumber.textContent = item ? (item.setup ? 'SETUP' : `CHAPTER ${String(item.number).padStart(2, '0')}`) : (state.phase === PHASE.DONE ? 'COMPLETE' : '—');
+    ui.heroState.textContent = phaseNames[state.phase] || 'Ready';
+    ui.progress.style.width = total ? `${Math.max(0, complete) / total * 100}%` : '0%';
+    ui.dot.className = `ad-dot ${state.paused ? 'ad-dot-paused' : state.phase === PHASE.DONE ? 'ad-dot-done' : 'ad-dot-live'}`;
+    ui.assignment.textContent = state.assignment ? `This tab owns chapters ${state.assignment.start}–${state.assignment.end}` : `Workspace range: ${Math.min(settings.start, settings.end)}–${Math.max(settings.start, settings.end)}`;
+    ui.retry.disabled = item?.status !== 'failed';
+    ui.useVisible.disabled = item?.status !== 'failed' || item?.setup || !latestPanelResponse(item);
+    ui.skip.disabled = !item || state.phase === PHASE.DONE;
+    const recent = state.items.filter(entry => !entry.setup).slice(0, 12);
+    ui.queue.replaceChildren(...recent.map(entry => element('div', { class: `ad-queue-row ad-${entry.status}` }, element('span', { text: `CH ${String(entry.number).padStart(2, '0')}` }), element('b', { text: entry.status === 'saved' ? 'saved' : entry.status === 'failed' ? 'needs you' : entry.status === 'sent' || entry.status === 'writing' ? 'in progress' : entry.status }))));
+    const status = `${state.phase}:${item?.id || ''}:${complete}:${total}`;
+    if (status !== lastStatus) { lastStatus = status; updateBook(); }
+  }
 
   function boot() {
-    loadSettings(() => {
+    readSettings(() => {
       loadAssignment();
-      adoptAssignment();
-      buildPanel();
-      refreshRangeInputs();
-      if (state.assignment) showAssignmentBanner();
-      const restored = restoreState();
-      if (restored && state.queue.length && state.idx < state.queue.length) {
-        log(`Restored previous queue (${state.idx}/${state.queue.length} done). Press Resume to continue.`);
-      } else if (state.assignment) {
-        log(`This tab is assigned chapters ${state.assignment.s}–${state.assignment.e}. Attach the PDFs and press Begin.`);
+      buildUI();
+      const restored = restoreRun();
+      if (!restored && state.assignment && settings.folderAutomation) {
+        note(`Loading this tab’s assigned PDFs from “${settings.folderName || 'selected folder'}”…`);
+        setTimeout(() => autoLoadFolderForThisTab(false), 800);
       } else {
-        log('Ready. Fill Book setup once, set your range, press Start — or split across tabs with Open batch tabs.');
+        note(restored ? 'A previous run is restored safely. Resume watches an already-sent prompt; it does not re-send it.' : 'Upload PDFs through ChatGPT, set your range, then start a new run.');
       }
-      updateBookUI();
-      try {
-        chrome.storage.onChanged.addListener((changes, area) => {
-          if (area === 'local' && Object.keys(changes).some(k => k.startsWith(CHAP_PREFIX))) updateBookUI();
-        });
-      } catch {}
-      updateUI();
+      try { chrome.storage.onChanged.addListener((changes, area) => { if (area === 'local' && Object.keys(changes).some(key => key.startsWith(CHAPTER_KEY) || key.startsWith(LEGACY_CHAPTER_KEY))) updateBook(); }); } catch {}
+      render(); updateBook();
     });
   }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
-  } else {
-    boot();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();
