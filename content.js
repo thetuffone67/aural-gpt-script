@@ -16,10 +16,12 @@
   const FOLDER_DB = 'auralChapterDeskFiles';
   const FOLDER_STORE = 'handles';
   const FOLDER_RECORD = 'selected-pdf-folder';
+  const BATCH_KEY = 'auralDeskBatch_';
+  const BATCH_DONE_KEY = 'auralDeskBatchDone_';
 
   const DEFAULTS = {
     template: 'go {n}', start: 1, end: 20, harvest: true, sendSetup: false, masterPrompt: '', bookLinks: ['', '', '', '', ''],
-    styleSample: '', tabCount: 3, folderAutomation: false, folderName: '',
+    styleSample: '', tabCount: 3, folderAutomation: false, folderName: '', attentionSound: true, completionVoice: true,
   };
   let settings = { ...DEFAULTS };
   let assignment = null;
@@ -34,7 +36,7 @@
   const state = {
     items: [], activeId: null, phase: PHASE.IDLE, paused: true, phaseAt: now(),
     baselineAssistant: '', baselineUser: '', stableLength: -1, stableAt: 0,
-    assignment: null, selectedChapterNumbers: null,
+    assignment: null, selectedChapterNumbers: null, batchId: null, batchRanges: null, completionAnnounced: false,
   };
   // These are internal safeguards, not settings the user has to tune. A
   // response must be visibly quiet for a moment after ChatGPT drops its Stop
@@ -42,6 +44,76 @@
   const AUTO_QUIET_MS = 2500;
   const NEXT_CHAPTER_MS = 750;
   const MAX_AUTO_PDFS_PER_TAB = 12;
+  let alarmContext = null;
+  let alarmTimers = [];
+
+  // ---- attention sound -----------------------------------------------------
+
+  function prepareAlarm() {
+    if (!settings.attentionSound) return null;
+    try {
+      const Audio = window.AudioContext || window.webkitAudioContext;
+      if (!Audio) return null;
+      alarmContext ||= new Audio();
+      if (alarmContext.state === 'suspended') alarmContext.resume();
+      return alarmContext;
+    } catch { return null; }
+  }
+  function stopAttentionAlarm() {
+    alarmTimers.forEach(timer => clearTimeout(timer));
+    alarmTimers = [];
+  }
+  function playAttentionChime() {
+    const context = prepareAlarm();
+    if (!context) return;
+    try {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(880, context.currentTime);
+      oscillator.frequency.setValueAtTime(1175, context.currentTime + 0.12);
+      gain.gain.setValueAtTime(0.0001, context.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.13, context.currentTime + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.34);
+      oscillator.connect(gain); gain.connect(context.destination);
+      oscillator.start(); oscillator.stop(context.currentTime + 0.36);
+    } catch {}
+  }
+  function startAttentionAlarm() {
+    stopAttentionAlarm();
+    if (!settings.attentionSound) return;
+    // Five spaced chimes are noticeable without looping forever.
+    for (let count = 0; count < 5; count++) {
+      alarmTimers.push(setTimeout(playAttentionChime, count * 850));
+    }
+  }
+  function speakCompletion(message) {
+    if (!settings.completionVoice || state.completionAnnounced || !('speechSynthesis' in window)) return;
+    try {
+      speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(message);
+      utterance.rate = 0.93;
+      utterance.pitch = 1.05;
+      utterance.volume = 1;
+      speechSynthesis.speak(utterance);
+      state.completionAnnounced = true;
+    } catch {}
+  }
+  function announceBatchCompletion() {
+    if (!state.batchId) { speakCompletion('This tab is done.'); return; }
+    try {
+      const doneKey = BATCH_DONE_KEY + state.batchId + '_' + state.assignment.start + '-' + state.assignment.end;
+      chrome.storage.local.set({ [doneKey]: true }, () => {
+        chrome.storage.local.get(BATCH_KEY + state.batchId, data => {
+          const ranges = data[BATCH_KEY + state.batchId]?.ranges || state.batchRanges || [];
+          const keys = ranges.map(range => BATCH_DONE_KEY + state.batchId + '_' + range.start + '-' + range.end);
+          chrome.storage.local.get(keys, marks => {
+            if (keys.length && keys.every(key => marks[key])) speakCompletion('All batch tabs are done. Your script is ready.');
+          });
+        });
+      });
+    } catch {}
+  }
 
   // ---- ChatGPT page adapters ------------------------------------------------
 
@@ -196,7 +268,7 @@
   }
   function persistRun() {
     try {
-      sessionStorage.setItem(RUN_KEY, JSON.stringify({ items: state.items, activeId: state.activeId, assignment: state.assignment, selectedChapterNumbers: state.selectedChapterNumbers }));
+      sessionStorage.setItem(RUN_KEY, JSON.stringify({ items: state.items, activeId: state.activeId, assignment: state.assignment, selectedChapterNumbers: state.selectedChapterNumbers, batchId: state.batchId, batchRanges: state.batchRanges }));
     } catch {}
   }
   function restoreRun() {
@@ -207,6 +279,8 @@
       state.activeId = saved.activeId;
       state.assignment = saved.assignment || assignment;
       state.selectedChapterNumbers = saved.selectedChapterNumbers || null;
+      state.batchId = saved.batchId || state.batchId;
+      state.batchRanges = saved.batchRanges || state.batchRanges;
       state.phase = PHASE.PAUSED;
       state.paused = true;
       return true;
@@ -238,12 +312,18 @@
 
   function loadAssignment() {
     const match = INITIAL_HASH.match(/#aural=(\d+)-(\d+)/);
+    const batchMatch = INITIAL_HASH.match(/[&#]batch=([a-zA-Z0-9_-]+)/);
     if (match) {
       assignment = { start: +match[1], end: +match[2] };
-      try { sessionStorage.setItem(ASSIGNMENT_KEY, JSON.stringify(assignment)); } catch {}
+      state.batchId = batchMatch?.[1] || null;
+      try { sessionStorage.setItem(ASSIGNMENT_KEY, JSON.stringify({ assignment, batchId: state.batchId })); } catch {}
       history.replaceState(null, '', location.pathname + location.search);
     } else {
-      try { assignment = JSON.parse(sessionStorage.getItem(ASSIGNMENT_KEY) || 'null'); } catch {}
+      try {
+        const saved = JSON.parse(sessionStorage.getItem(ASSIGNMENT_KEY) || 'null');
+        assignment = saved?.assignment || saved;
+        state.batchId = saved?.batchId || null;
+      } catch {}
     }
     state.assignment = assignment;
   }
@@ -320,6 +400,7 @@
   }
   let filePickerArmed = false;
   function attachPdfsAndBegin() {
+    prepareAlarm();
     const input = chatFileInput();
     if (!input) return note('Could not find ChatGPT’s attachment input. Use ChatGPT’s + button, then press Begin (PDFs attached).');
     if (!filePickerArmed) {
@@ -335,6 +416,7 @@
     input.click();
   }
   function beginWithAlreadyAttachedPdfs() {
+    prepareAlarm();
     const files = Array.from(chatFileInput()?.files || []);
     if (files.length) beginWithSelectedFiles(files);
     else {
@@ -365,6 +447,7 @@
     }
   }
   async function chooseFolderAndOpenBatches() {
+    prepareAlarm();
     if (!window.showDirectoryPicker) return note('Folder automation requires Chrome or Edge. Use Attach PDFs + Begin instead.');
     try {
       const folder = await window.showDirectoryPicker({ mode: 'read' });
@@ -404,9 +487,14 @@
     const full = { start: Math.min(settings.start, settings.end), end: Math.max(settings.start, settings.end) };
     const parts = splitRange(full.start, full.end, settings.tabCount);
     if (parts.length < 2) return note('Use at least two chapters to open a batch.');
+    const batchId = crypto.randomUUID ? crypto.randomUUID() : `${now()}-${Math.random().toString(36).slice(2)}`;
     assignment = parts[0]; state.assignment = assignment;
-    try { sessionStorage.setItem(ASSIGNMENT_KEY, JSON.stringify(assignment)); } catch {}
-    const urls = parts.slice(1).map(part => `${location.origin}${location.pathname}#aural=${part.start}-${part.end}`);
+    state.batchId = batchId; state.batchRanges = parts; state.completionAnnounced = false;
+    try {
+      sessionStorage.setItem(ASSIGNMENT_KEY, JSON.stringify({ assignment, batchId }));
+      chrome.storage.local.set({ [BATCH_KEY + batchId]: { ranges: parts, createdAt: now() } });
+    } catch {}
+    const urls = parts.slice(1).map(part => `${location.origin}${location.pathname}#aural=${part.start}-${part.end}&batch=${batchId}`);
     try { chrome.runtime.sendMessage({ type: 'openTabs', urls }); } catch { urls.forEach(url => window.open(url, '_blank')); }
     note(`Batch ready. This tab owns ${assignment.start}–${assignment.end}; the other tabs have their own ranges.`);
     render();
@@ -421,9 +509,12 @@
     state.paused = true;
     setPhase(PHASE.PAUSED);
     persistRun();
+    startAttentionAlarm();
     note(`Paused: ${message}`);
   }
   function beginFresh() {
+    prepareAlarm();
+    stopAttentionAlarm();
     state.items = makeQueue();
     state.activeId = state.items[0]?.id || null;
     state.paused = false;
@@ -434,6 +525,8 @@
     note(`New run ready: ${state.items.filter(item => !item.setup).length} chapters. Each chapter can be sent only once.`);
   }
   function resume() {
+    prepareAlarm();
+    stopAttentionAlarm();
     const item = active();
     if (!item) return beginFresh();
     if (item.status === 'failed') return note('If the finished panel script is visible, use Save answer + continue. Only use Retry chapter when you truly need a new generation.');
@@ -486,11 +579,13 @@
       state.paused = true;
       setPhase(PHASE.DONE);
       note('Run complete. Your chapters are in the Script Vault.');
+      announceBatchCompletion();
       return;
     }
     setPhase(PHASE.COOLDOWN);
   }
   function retryCurrent() {
+    stopAttentionAlarm();
     const item = active();
     if (!item || item.status !== 'failed') return;
     // Retrying is intentional and always visibly recorded as a new attempt.
@@ -502,6 +597,7 @@
     note(`Manual retry armed for ${item.label} (attempt ${(item.attempts || 0) + 1}).`);
   }
   function skipCurrent() {
+    stopAttentionAlarm();
     const item = active();
     if (!item) return;
     item.status = 'skipped'; item.finishedAt = now();
@@ -538,6 +634,7 @@
     const answer = latestPanelResponse(item);
     const panels = answer && extractPanels(answer.text);
     if (!panels) return note('I cannot find a visible [Panel] script to save yet. Do not retry unless you truly want another generation.');
+    stopAttentionAlarm();
     item.status = 'saving';
     item.error = '';
     state.paused = false;
@@ -705,7 +802,15 @@
 
     const harvest = element('input', { type: 'checkbox' }); harvest.checked = settings.harvest;
     harvest.addEventListener('change', () => { settings.harvest = harvest.checked; saveSettings(); });
-    body.append(element('details', { class: 'ad-card ad-advanced' }, element('summary', { text: 'Automation options' }), element('div', { class: 'ad-details' }, element('label', { class: 'ad-check' }, harvest, ' Save [Panel] output into Script Vault'))));
+    const sound = element('input', { type: 'checkbox' }); sound.checked = settings.attentionSound;
+    sound.addEventListener('change', () => {
+      settings.attentionSound = sound.checked;
+      if (sound.checked) prepareAlarm(); else stopAttentionAlarm();
+      saveSettings();
+    });
+    const completionVoice = element('input', { type: 'checkbox' }); completionVoice.checked = settings.completionVoice;
+    completionVoice.addEventListener('change', () => { settings.completionVoice = completionVoice.checked; saveSettings(); });
+    body.append(element('details', { class: 'ad-card ad-advanced' }, element('summary', { text: 'Automation options' }), element('div', { class: 'ad-details' }, element('label', { class: 'ad-check' }, harvest, ' Save [Panel] output into Script Vault'), element('label', { class: 'ad-check' }, sound, ' Play 5-chime sound when I need to act'), element('label', { class: 'ad-check' }, completionVoice, ' Say “all batch tabs are done” when finished'))));
 
     ui.bookStatus = element('div', { class: 'ad-book-status' });
     ui.clear = element('button', { class: 'ad-link ad-danger', text: 'Clear vault', onclick: clearBook });

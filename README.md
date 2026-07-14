@@ -6,6 +6,10 @@ A fresh, send-once ChatGPT extension for generating chapter scripts. It has a sm
 
 One automatic attempt means one Send click. The runner watches ChatGPT's generation state and the actual reply text; when ChatGPT has stopped and the reply is no longer changing, it saves the chapter and sends the next `go …` automatically. There are no delay, settle, or timeout controls. It scans backward for the visible `[Panel]` response, so an empty ChatGPT wrapper cannot make a finished chapter fail. If the UI ever misses a finished visible response, press **Save answer + continue**—not Retry—to save it without spending another generation.
 
+When the runner pauses because it needs you, it plays five attention chimes. The sound stops as soon as you click **Save answer + continue**, **Retry chapter**, **Skip**, **Resume**, or start a new run. You can turn it off under **Automation options**.
+
+When a batch run finishes, the final tab says, “All batch tabs are done. Your script is ready.” No MP3 is needed; it uses the browser’s built-in voice. You can turn this off under **Automation options**.
+
 ## Run a book
 
 1. Load this folder through `chrome://extensions` → **Load unpacked**.
