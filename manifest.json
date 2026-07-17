@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Aural Chapter Desk",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "A send-once chapter runner for ChatGPT with a shared Script Vault and batch tabs.",
   "icons": {
     "16": "icons/icon16.png",
@@ -19,6 +19,12 @@
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["done-notification.mp3"],
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"]
     }
   ]
 }

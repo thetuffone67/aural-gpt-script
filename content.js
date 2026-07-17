@@ -46,6 +46,7 @@
   const MAX_AUTO_PDFS_PER_TAB = 12;
   let alarmContext = null;
   let alarmTimers = [];
+  let completionAudio = null;
 
   // ---- attention sound -----------------------------------------------------
 
@@ -57,6 +58,15 @@
       alarmContext ||= new Audio();
       if (alarmContext.state === 'suspended') alarmContext.resume();
       return alarmContext;
+    } catch { return null; }
+  }
+  function prepareCompletionAudio() {
+    if (!settings.completionVoice || completionAudio) return completionAudio;
+    try {
+      completionAudio = new Audio(chrome.runtime.getURL('done-notification.mp3'));
+      completionAudio.preload = 'auto';
+      completionAudio.volume = 0.9;
+      return completionAudio;
     } catch { return null; }
   }
   function stopAttentionAlarm() {
@@ -88,16 +98,21 @@
     }
   }
   function speakCompletion(message) {
-    if (!settings.completionVoice || state.completionAnnounced || !('speechSynthesis' in window)) return;
+    if (!settings.completionVoice || state.completionAnnounced) return;
+    state.completionAnnounced = true;
+    // The bundled MP3 is the normal completion voice. Browser speech is a
+    // fallback when Chrome cannot play the local audio asset.
     try {
-      speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(message);
-      utterance.rate = 0.93;
-      utterance.pitch = 1.05;
-      utterance.volume = 1;
-      speechSynthesis.speak(utterance);
-      state.completionAnnounced = true;
-    } catch {}
+      const audio = prepareCompletionAudio();
+      if (audio) {
+        audio.currentTime = 0;
+        audio.play().catch(() => {
+          if ('speechSynthesis' in window) speechSynthesis.speak(new SpeechSynthesisUtterance(message));
+        });
+      } else if ('speechSynthesis' in window) {
+        speechSynthesis.speak(new SpeechSynthesisUtterance(message));
+      }
+    } catch { if ('speechSynthesis' in window) speechSynthesis.speak(new SpeechSynthesisUtterance(message)); }
   }
   function announceBatchCompletion() {
     if (!state.batchId) { speakCompletion('This tab is done.'); return; }
@@ -401,6 +416,7 @@
   let filePickerArmed = false;
   function attachPdfsAndBegin() {
     prepareAlarm();
+    prepareCompletionAudio();
     const input = chatFileInput();
     if (!input) return note('Could not find ChatGPT’s attachment input. Use ChatGPT’s + button, then press Begin (PDFs attached).');
     if (!filePickerArmed) {
@@ -417,6 +433,7 @@
   }
   function beginWithAlreadyAttachedPdfs() {
     prepareAlarm();
+    prepareCompletionAudio();
     const files = Array.from(chatFileInput()?.files || []);
     if (files.length) beginWithSelectedFiles(files);
     else {
@@ -448,6 +465,7 @@
   }
   async function chooseFolderAndOpenBatches() {
     prepareAlarm();
+    prepareCompletionAudio();
     if (!window.showDirectoryPicker) return note('Folder automation requires Chrome or Edge. Use Attach PDFs + Begin instead.');
     try {
       const folder = await window.showDirectoryPicker({ mode: 'read' });
@@ -514,6 +532,7 @@
   }
   function beginFresh() {
     prepareAlarm();
+    prepareCompletionAudio();
     stopAttentionAlarm();
     state.items = makeQueue();
     state.activeId = state.items[0]?.id || null;
@@ -526,6 +545,7 @@
   }
   function resume() {
     prepareAlarm();
+    prepareCompletionAudio();
     stopAttentionAlarm();
     const item = active();
     if (!item) return beginFresh();
@@ -810,7 +830,7 @@
     });
     const completionVoice = element('input', { type: 'checkbox' }); completionVoice.checked = settings.completionVoice;
     completionVoice.addEventListener('change', () => { settings.completionVoice = completionVoice.checked; saveSettings(); });
-    body.append(element('details', { class: 'ad-card ad-advanced' }, element('summary', { text: 'Automation options' }), element('div', { class: 'ad-details' }, element('label', { class: 'ad-check' }, harvest, ' Save [Panel] output into Script Vault'), element('label', { class: 'ad-check' }, sound, ' Play 5-chime sound when I need to act'), element('label', { class: 'ad-check' }, completionVoice, ' Say “all batch tabs are done” when finished'))));
+    body.append(element('details', { class: 'ad-card ad-advanced' }, element('summary', { text: 'Automation options' }), element('div', { class: 'ad-details' }, element('label', { class: 'ad-check' }, harvest, ' Save [Panel] output into Script Vault'), element('label', { class: 'ad-check' }, sound, ' Play 5-chime sound when I need to act'), element('label', { class: 'ad-check' }, completionVoice, ' Play done voice when all batch tabs finish'))));
 
     ui.bookStatus = element('div', { class: 'ad-book-status' });
     ui.clear = element('button', { class: 'ad-link ad-danger', text: 'Clear vault', onclick: clearBook });

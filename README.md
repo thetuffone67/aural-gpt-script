@@ -8,7 +8,7 @@ One automatic attempt means one Send click. The runner watches ChatGPT's generat
 
 When the runner pauses because it needs you, it plays five attention chimes. The sound stops as soon as you click **Save answer + continue**, **Retry chapter**, **Skip**, **Resume**, or start a new run. You can turn it off under **Automation options**.
 
-When a batch run finishes, the final tab says, “All batch tabs are done. Your script is ready.” No MP3 is needed; it uses the browser’s built-in voice. You can turn this off under **Automation options**.
+When a batch run finishes, the final tab plays the bundled `done-notification.mp3`: “All batch tabs are done. Your script is ready.” Browser speech is only used as a fallback. You can turn this off under **Automation options**.
 
 ## Run a book
 
